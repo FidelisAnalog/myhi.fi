@@ -1,0 +1,1352 @@
+"""
+wf_core — Wow & Flutter Analysis Engine
+
+Single analysis engine for turntable FG signal analysis.
+Supports two input types:
+  - Audio PCM (FG signal from turntable motor)
+  - Device text exports (e.g. ShakNSpin)
+
+API:
+  analyzeFull(data, sampleRate=None, inputType='audio')  → full result dict
+  getPlotData(plotId, params={})                          → on-demand plot arrays
+
+No plotting, no file I/O, no CLI. Consumers (SPA frontend, CLI wrapper)
+handle presentation.
+
+Signal processing pipeline (audio):
+  1. Carrier frequency estimation via FFT peak detection
+  2. Auto-tuned bandpass prefilter centered on carrier
+  3. Vectorized zero-crossing detection with hysteresis
+  4. Per-cycle frequency from crossing periods
+  5. Adaptive edge trimming + outlier rejection + median despike
+  6. CubicSpline interpolation to uniform time grid
+  7. Metrics: AES6/DIN weighted + unweighted + drift
+  8. Spectrum + peak detection + motor harmonic ID
+  9. AM/FM coupling markers (audio only)
+
+Device pipeline enters at step 7 (deviation already available).
+"""
+
+import numpy as np
+from scipy.signal import (butter, filtfilt, sosfiltfilt, bilinear,
+                          lfilter, lfilter_zi, freqz, medfilt, hilbert,
+                          resample_poly, decimate)
+from scipy.interpolate import CubicSpline
+from scipy.signal import find_peaks as _find_peaks
+
+
+# ========================= INTERNAL CONSTANTS =========================
+
+PREFILTER_BW_FACTOR = .45 #0.30
+PREFILTER_ORDER = 2
+SMOOTH_CYCLES = 1
+OUTLIER_THRESH_PCT = 10.0
+
+# Coupling marker significance multiplier (× median)
+_COUPLING_SIG_MULT = 3.0
+
+
+# ========================= MODULE STATE =========================
+# Stashed by analyzeFull, consumed by getPlotData.
+# Cleared on each new analyzeFull call.
+
+_state = {}
+
+
+def _clear_state():
+    global _state
+    _state = {}
+
+
+# ========================= STATUS CALLBACK =========================
+
+_status_callback = None
+
+
+def set_status_callback(cb):
+    """Set a callback function for progress updates. cb(message: str)."""
+    global _status_callback
+    _status_callback = cb
+
+
+async def _status(msg):
+    if _status_callback is not None:
+        result = _status_callback(msg)
+        if hasattr(result, '__await__'):
+            await result
+
+
+# ========================= SIGNAL PROCESSING =========================
+
+def _estimate_carrier_freq(sig, fs):
+    """Carrier frequency estimate using FFT peak detection on first 2s."""
+    n_samp = min(len(sig), int(2.0 * fs))
+    s = sig[:n_samp].astype(np.float64)
+    s = s - np.mean(s)
+    win = np.hanning(len(s))
+    X = np.abs(np.fft.rfft(s * win))
+    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
+    min_idx = max(1, int(20.0 / (fs / len(s))))
+    peak_idx = min_idx + np.argmax(X[min_idx:])
+    return freqs[peak_idx]
+
+
+def _bandpass_prefilter(sig, fs, low, high, order=2):
+    """Bandpass to clean up signal before zero-crossing detection."""
+    nyq = fs / 2.0
+    b, a = butter(order, [low / nyq, high / nyq], btype='band')
+    return filtfilt(b, a, sig)
+
+
+def _find_zero_crossings(sig, fs, hysteresis_frac=0.05, sinc_taps=32):
+    """
+    Positive-going zero crossings with hysteresis + linear interpolation.
+    Vectorized via searchsorted.
+    Returns array of crossing times in seconds.
+    """
+    sig = sig - np.mean(sig)
+    threshold = hysteresis_frac * np.max(np.abs(sig))
+
+    zc_mask = (sig[:-1] < 0) & (sig[1:] >= 0)
+    zc_indices = np.where(zc_mask)[0]
+
+    arm_mask = sig < -threshold
+    arm_indices = np.where(arm_mask)[0]
+
+    if len(zc_indices) == 0 or len(arm_indices) == 0:
+        return np.array([])
+
+    prev_zc = np.empty_like(zc_indices)
+    prev_zc[0] = 0
+    prev_zc[1:] = zc_indices[:-1]
+
+    arm_search = np.searchsorted(arm_indices, prev_zc, side='left')
+    valid = ((arm_search < len(arm_indices)) &
+             (arm_indices[np.minimum(arm_search, len(arm_indices) - 1)] < zc_indices))
+    crossing_indices = zc_indices[valid]
+
+    margin = max(sinc_taps, 1)
+    crossing_indices = crossing_indices[
+        (crossing_indices >= margin) &
+        (crossing_indices < len(sig) - margin - 1)
+    ]
+
+    s0 = sig[crossing_indices]
+    s1 = sig[crossing_indices + 1]
+    frac = -s0 / (s1 - s0)
+    times = (crossing_indices.astype(np.float64) + frac) / fs
+    return times
+
+
+def _crossings_to_frequency(crossing_times):
+    """Convert zero-crossing times to instantaneous frequency estimates."""
+    periods = np.diff(crossing_times)
+    midpoints = crossing_times[:-1] + periods / 2.0
+    freqs = 1.0 / periods
+    return midpoints, freqs
+
+
+def _smooth_frequency(freqs, n_cycles):
+    """Simple moving average over n_cycles."""
+    if n_cycles <= 1:
+        return freqs
+    kernel = np.ones(n_cycles) / n_cycles
+    smoothed = np.convolve(freqs, kernel, mode='same')
+    half = n_cycles // 2
+    for i in range(half):
+        smoothed[i] = np.mean(freqs[:i + half + 1])
+        smoothed[-(i + 1)] = np.mean(freqs[-(i + half + 1):])
+    return smoothed
+
+
+def _interpolate_to_uniform(times, freqs, output_rate=None, sinc_taps=16):
+    """
+    Resample non-uniform frequency samples to uniform time grid.
+    CubicSpline — vectorized, fast in Pyodide.
+    Returns (t_uniform, f_uniform, output_rate).
+    """
+    if output_rate is None:
+        output_rate = len(times) / (times[-1] - times[0])
+
+    dt_raw = (times[-1] - times[0]) / (len(times) - 1)
+    margin = sinc_taps * dt_raw
+    t_start = times[0] + margin
+    t_end = times[-1] - margin
+    t_uniform = np.arange(t_start, t_end, 1.0 / output_rate)
+
+    cs = CubicSpline(times, freqs)
+    f_uniform = cs(t_uniform)
+    return t_uniform, f_uniform, output_rate
+
+
+def _edge_trim(t_freq, freq, prefilter_bw_hz=None):
+    """
+    Edge trim combining time-based minimum (prefilter settling) with
+    amplitude-based detection for large outliers.
+
+    Time-based: trim at least 2/bw_hz seconds from each end — covers
+    the prefilter's startup/shutdown transient regardless of carrier rate.
+
+    Amplitude-based: also scan first/last 20 crossings for any that
+    exceed 5×MAD, and extend the trim to cover them.
+    """
+    if len(t_freq) <= 40:
+        return t_freq, freq
+
+    n_xing = len(freq)
+
+    # --- Time-based minimum trim (prefilter settling) ---
+    time_trim = 0
+    if prefilter_bw_hz is not None and prefilter_bw_hz > 0:
+        settle_s = 2.0 / prefilter_bw_hz
+        t_start = t_freq[0]
+        t_end = t_freq[-1]
+        # Count crossings within settle_s of each edge
+        time_trim_start = int(np.searchsorted(t_freq, t_start + settle_s))
+        time_trim_end = n_xing - int(np.searchsorted(t_freq, t_end - settle_s))
+    else:
+        time_trim_start = 0
+        time_trim_end = 0
+
+    # --- Amplitude-based trim (original logic) ---
+    interior = freq[n_xing // 10: -n_xing // 10]
+    f_med = np.median(interior)
+    mad = np.median(np.abs(interior - f_med))
+    thresh = 5.0 * mad / f_med * 100.0
+    dev_from_med = np.abs(freq - f_med) / f_med * 100.0
+
+    amp_trim_start = 0
+    for i in range(min(20, n_xing)):
+        if dev_from_med[i] >= thresh:
+            amp_trim_start = i + 1
+
+    amp_trim_end = 0
+    for i in range(n_xing - 1, max(n_xing - 21, -1), -1):
+        if dev_from_med[i] >= thresh:
+            amp_trim_end = n_xing - i
+
+    # Take the larger of time-based and amplitude-based
+    trim_start = max(time_trim_start, amp_trim_start)
+    trim_end = max(time_trim_end, amp_trim_end)
+
+    if trim_start > 0 or trim_end > 0:
+        end_idx = n_xing - trim_end if trim_end > 0 else n_xing
+        t_freq = t_freq[trim_start:end_idx]
+        freq = freq[trim_start:end_idx]
+
+    return t_freq, freq
+
+
+def _outlier_reject(t_freq, freq):
+    """MAD-based adaptive outlier rejection."""
+    f_median = np.median(freq)
+    mad = np.median(np.abs(freq - f_median))
+    mad_thresh_hz = max(8.0 * mad, f_median * 0.001)
+    mad_thresh_hz = min(mad_thresh_hz, f_median * OUTLIER_THRESH_PCT / 100.0)
+    outlier_mask = np.abs(freq - f_median) > mad_thresh_hz
+    n_rejected = int(np.sum(outlier_mask))
+    if n_rejected > 0:
+        t_freq = t_freq[~outlier_mask]
+        freq = freq[~outlier_mask]
+    return t_freq, freq, n_rejected
+
+
+def _median_despike(t_freq, freq, kernel=5):
+    """Median despike for high-carrier signals (>500 Hz)."""
+    f_carrier_est = (len(freq) / (t_freq[-1] - t_freq[0])
+                     if len(t_freq) > 1 else 0)
+    if f_carrier_est > 500 and len(freq) > kernel:
+        mad_clean = np.median(np.abs(freq - np.median(freq)))
+        freq_med = medfilt(freq, kernel_size=kernel)
+        spike_thresh = 3.0 * mad_clean
+        is_spike = np.abs(freq - freq_med) > spike_thresh
+        if np.any(is_spike):
+            freq = freq.copy()
+            freq[is_spike] = freq_med[is_spike]
+    return freq
+
+
+# ========================= AES6 WEIGHTING FILTER =========================
+
+def _make_aes6_weighting_filter(fs=1000.0):
+    """
+    AES6-2008 frequency weighting filter.
+
+    Analog prototype optimized via Wurcer's methodology (brute grid +
+    differential evolution, PTP error metric) against all 17 AES6 Table 1
+    spec points.  Designed for fs=1000 Hz (post-SRC).
+
+    Topology:
+      - 3 zeros at DC (s^3)          -> 18 dB/oct highpass
+      - Triple real pole at 0.6265 Hz -> HP-to-BP transition shaping
+      - 1 real pole at 11.32 Hz      -> ~6 dB/oct LPF rolloff
+      - 1 finite zero at 227.9 Hz    -> HF rolloff shaping
+
+    Performance at fs=1000 Hz:
+      PTP error vs Table 1:  1.013 dB
+      17/17 spec points:     ALL PASS
+      Min margin to tol:     1.32 dB (at 1.6 Hz)
+
+    Returns (b, a) digital filter coefficients via bilinear transform.
+    """
+    POLES_HZ = [0.626524, 0.626524, 0.626524, 11.316542]
+    ZERO_FINITE_HZ = 227.918719
+
+    num_s = np.convolve([1.0, 0, 0, 0], [1, 2 * np.pi * ZERO_FINITE_HZ])
+    den_s = np.array([1.0])
+    for p in POLES_HZ:
+        den_s = np.convolve(den_s, [1, 2 * np.pi * p])
+
+    b, a = bilinear(num_s, den_s, fs=fs)
+    w4 = 2 * np.pi * 4.0 / fs
+    _, h_ref = freqz(b, a, worN=[w4])
+    b /= np.abs(h_ref[0])
+    return b, a
+
+
+def _src_to_1khz(signal, fs):
+    """
+    Sample-rate convert deviation signal to 1 kHz.
+
+    Odd-extension pads the signal before resample_poly (same technique
+    scipy's filtfilt uses internally) — preserves both amplitude and
+    derivative at boundaries, preventing FIR anti-aliasing ringing.
+
+    Returns (signal_1k, 1000.0) or (signal, fs) if already at 1 kHz.
+    """
+    FS_TARGET = 1000
+    if abs(fs - FS_TARGET) < 0.5:
+        return signal, float(fs)
+
+    from math import gcd
+    g = gcd(int(FS_TARGET), int(round(fs)))
+    up = int(FS_TARGET) // g
+    down = int(round(fs)) // g
+
+    # Odd extension (filtfilt-style): preserves both amplitude AND derivative
+    # at boundary.  2*signal[0] - signal[N:0:-1] continues the slope smoothly.
+    pad_n = min(int(0.5 * fs), len(signal) // 4)
+    padded = np.concatenate([
+        2 * signal[0] - signal[pad_n:0:-1],
+        signal,
+        2 * signal[-1] - signal[-2:-pad_n - 2:-1],
+    ])
+
+    resampled = resample_poly(padded, up, down)
+
+    # Trim mirrored portions
+    pad_out = int(round(pad_n * up / down))
+    trimmed = resampled[pad_out:len(resampled) - pad_out]
+
+    return trimmed, float(FS_TARGET)
+
+
+# ========================= METRICS =========================
+
+def _metric(value, confidence=0):
+    """Create a metric dict: { value, confidence }."""
+    return {'value': float(value), 'confidence': int(confidence)}
+
+
+def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0):
+    """
+    Compute all wow & flutter metrics from fractional deviation signal.
+
+    All metrics computed at 1 kHz (single path via mirror-padded SRC).
+    Weighting filter uses lfilter + lfilter_zi (causal, zero transient).
+
+    Returns:
+        standard: dict of standardized metrics (AES6/DIN/IEC)
+        non_standard: dict of non-standardized metrics
+    """
+    # --- SRC everything to 1 kHz (single signal path) ---
+    dev, fs_w = _src_to_1khz(deviation_frac, fs)
+
+    skip = int(skip_seconds * fs_w)
+    nyquist = fs_w / 2.0
+    n_total = len(dev)
+    capture_dur = n_total / fs_w
+
+    # --- Unweighted (AES6 + Virtins spec) ---
+    # Lower bound 0.2 Hz (AES6 6.1.1 NOTE), upper = min(0.4*carrier, 200 Hz)
+    bp_lo = 0.2
+    bp_hi = min(0.4 * carrier_freq, 200.0, nyquist * 0.95)
+    if bp_hi > bp_lo:
+        sos_bp = butter(4, [bp_lo / nyquist, bp_hi / nyquist],
+                         btype='band', output='sos')
+        dev_unwtd = sosfiltfilt(sos_bp, dev)
+    else:
+        dev_unwtd = dev.copy()
+
+    dev_u = dev_unwtd[skip:]
+    unwtd_peak = float(np.percentile(np.abs(dev_u), 95) * 100.0)
+    unwtd_rms = float(np.sqrt(np.mean(dev_u**2)) * 100.0)
+
+    # --- Weighted (standardized: AES6-2008 / DIN / IEC) ---
+    b_w, a_w = _make_aes6_weighting_filter(fs_w)
+    zi = lfilter_zi(b_w, a_w) * dev[0]
+    dev_weighted, _ = lfilter(b_w, a_w, dev, zi=zi)
+    dev_w = dev_weighted[skip:]
+    wtd_peak = float(np.percentile(np.abs(dev_w), 95) * 100.0)
+    wtd_rms = float(np.sqrt(np.mean(dev_w**2)) * 100.0)
+
+    # --- Band separation: wow (<6 Hz) and flutter (>6 Hz) ---
+    wow_cut = min(6.0, nyquist * 0.95)
+
+    # Weighted wow/flutter (standardized)
+    wtd_wow_rms = 0.0
+    wtd_flutter_rms = 0.0
+    if wow_cut > 0.5:
+        sos_wow = butter(6, wow_cut / nyquist, btype='low', output='sos')
+        wow_sig = sosfiltfilt(sos_wow, dev_weighted)
+        wtd_wow_rms = float(np.sqrt(np.mean(wow_sig[skip:]**2)) * 100.0)
+
+        sos_flutter = butter(6, wow_cut / nyquist, btype='high', output='sos')
+        flutter_sig = sosfiltfilt(sos_flutter, dev_weighted)
+        wtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig[skip:]**2)) * 100.0)
+
+    # Unweighted wow/flutter (Virtins spec)
+    # Wow: 0.5–6 Hz (both weighted and unweighted per Virtins)
+    # Flutter: 6 Hz – min(0.4*carrier, 200) Hz (upper inherited from dev_unwtd)
+    unwtd_wow_rms = 0.0
+    unwtd_flutter_rms = 0.0
+    if wow_cut > 0.5 and bp_hi > bp_lo:
+        wow_lo = 0.5
+        if wow_lo < nyquist * 0.95 and wow_cut < nyquist * 0.95 and wow_cut > wow_lo:
+            sos_wow_u = butter(6, [wow_lo / nyquist, wow_cut / nyquist],
+                               btype='band', output='sos')
+            wow_sig_u = sosfiltfilt(sos_wow_u, dev_unwtd)
+            unwtd_wow_rms = float(np.sqrt(np.mean(wow_sig_u[skip:]**2)) * 100.0)
+
+        sos_flutter_u = butter(6, wow_cut / nyquist, btype='high', output='sos')
+        flutter_sig_u = sosfiltfilt(sos_flutter_u, dev_unwtd)
+        unwtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig_u[skip:]**2)) * 100.0)
+
+    # --- Drift (non-standardized) ---
+    drift_rms = 0.0
+    drift_lo = max(0.05, 1.0 / capture_dur)
+    drift_hi = 0.5
+    if drift_hi > drift_lo and drift_hi < nyquist * 0.95:
+        drift_taper_s = 2.0
+        taper_n = min(int(drift_taper_s * fs_w), n_total // 4)
+        taper_window = np.ones(n_total)
+        ramp = 0.5 * (1 - np.cos(np.pi * np.arange(taper_n) / taper_n))
+        taper_window[:taper_n] = ramp
+        taper_window[-taper_n:] = ramp[::-1]
+
+        drift_order = 10
+        sos_drift = butter(drift_order,
+                           [drift_lo / nyquist, drift_hi / nyquist],
+                           btype='band', output='sos')
+        drift_sig = sosfiltfilt(sos_drift, dev * taper_window)
+
+        drift_skip = max(skip, taper_n, int(2.0 * fs_w))
+        if n_total > 2 * drift_skip:
+            drift_sig = drift_sig[drift_skip:-drift_skip]
+            drift_rms = float(np.sqrt(np.mean(drift_sig**2)) * 100.0)
+
+    # --- Confidence ---
+    # Placeholder: all 0 (full confidence).
+    # Future: heuristics based on duration, crossing density, SNR, etc.
+    conf = 0
+
+    standard = {
+        'weighted_peak':        _metric(wtd_peak, conf),
+        'weighted_rms':         _metric(wtd_rms, conf),
+        'weighted_wow_rms':     _metric(wtd_wow_rms, conf),
+        'weighted_flutter_rms': _metric(wtd_flutter_rms, conf),
+        'unweighted_peak':      _metric(unwtd_peak, conf),
+        'unweighted_rms':       _metric(unwtd_rms, conf),
+    }
+
+    non_standard = {
+        'unweighted_wow_rms':     _metric(unwtd_wow_rms, conf),
+        'unweighted_flutter_rms': _metric(unwtd_flutter_rms, conf),
+        'drift_rms':              _metric(drift_rms, conf),
+    }
+
+    return standard, non_standard
+
+
+# ========================= SPECTRUM =========================
+
+def _compute_spectrum(deviation_pct, output_rate, max_freq=50.0,
+                      max_peaks=16, peak_threshold=0.02):
+    """
+    Compute deviation spectrum and detect peaks.
+    max_freq: upper frequency limit (Hz) — prefilter bw_hz for audio, 50 for device.
+    Returns spectrum dict (freqs, amplitude, peaks without identity/coupling).
+    Arrays are truncated to max_freq.
+    """
+    N = len(deviation_pct)
+    win = np.hanning(N)
+    X = np.fft.rfft(deviation_pct * win)
+    freqs = np.fft.rfftfreq(N, d=1.0 / output_rate)
+
+    amp = np.abs(X) * np.sqrt(2.0) / (np.sum(win) * np.sqrt(freqs[1]))
+    fft_amp_bin = np.abs(X) * 2.0 / np.sum(win)
+
+    # Truncate to valid range
+    max_f = min(max_freq, output_rate / 2)
+    mask = freqs <= max_f
+    freqs = freqs[mask]
+    amp = amp[mask]
+    fft_amp_bin = fft_amp_bin[mask]
+
+    if len(amp) > 1:
+        pk_idx, _ = _find_peaks(amp, height=np.max(amp[1:]) * peak_threshold)
+        pk_idx = [p for p in pk_idx if freqs[p] > 0.3]
+        pk_idx = sorted(pk_idx, key=lambda p: amp[p], reverse=True)[:max_peaks]
+    else:
+        pk_idx = []
+
+    peaks = []
+    for p in sorted(pk_idx, key=lambda p: freqs[p]):
+        bin_rms = float(fft_amp_bin[p] / np.sqrt(2))
+        peaks.append({
+            'freq': float(freqs[p]),
+            'amplitude': float(amp[p]),
+            'rms': bin_rms,
+            'fft_bin_index': int(p),
+            'label': None,
+            'am_coupled': False,
+            'coupling_strength': None,
+        })
+
+    return {
+        'freqs': freqs.tolist(),
+        'amplitude': amp.tolist(),
+        'peaks': peaks,
+        'coupling_threshold': None,
+    }
+
+
+# ========================= MOTOR HARMONIC IDENTIFICATION =========================
+
+def _identify_motor_harmonics(peaks, f_rot, motor_slots=None,
+                               motor_poles=None, drive_ratio=1.0):
+    """
+    Tag peaks with motor harmonic labels.
+
+    f_rot: rotation frequency (rpm / 60). If None, no labeling is done.
+    motor_slots/motor_poles: enables electrical/slot/ripple labels.
+    drive_ratio: motor-to-platter speed ratio for non-direct-drive.
+        Motor frequencies at the platter are multiplied by drive_ratio.
+
+    Mutates peaks in-place (sets 'label' field).
+    """
+    if f_rot is None or f_rot <= 0:
+        return  # No rpm provided, can't label anything
+
+    # Motor frequencies adjusted for drive ratio
+    if motor_poles is not None:
+        pole_pairs = motor_poles // 2
+        f_elec = pole_pairs * f_rot * drive_ratio
+        f_ripple = 3 * f_elec
+    else:
+        f_elec = None
+        f_ripple = None
+
+    if motor_slots is not None:
+        f_slot = motor_slots * f_rot * drive_ratio
+    else:
+        f_slot = None
+
+    # Tolerance: scale with rotation freq
+    tol = max(f_rot * 0.3, 0.05)
+
+    for peak in peaks:
+        f = peak['freq']
+        label = None
+
+        # Most specific first: torque ripple
+        if f_ripple is not None:
+            for n in range(1, 5):
+                if abs(f - n * f_ripple) < tol:
+                    label = f'{n}× torque ripple' if n > 1 else 'torque ripple'
+                    break
+
+        # Slot passing
+        if label is None and f_slot is not None:
+            for n in range(1, 5):
+                if abs(f - n * f_slot) < tol:
+                    label = f'{n}× slot' if n > 1 else 'slot passing'
+                    break
+
+        # Electrical
+        if label is None and f_elec is not None:
+            for n in range(1, 10):
+                if abs(f - n * f_elec) < tol:
+                    label = f'{n}× electrical' if n > 1 else 'electrical'
+                    break
+
+        # Motor rotation harmonics (non-direct-drive only)
+        if label is None and drive_ratio != 1.0:
+            f_motor_rot = f_rot * drive_ratio
+            for n in range(1, 20):
+                if abs(f - n * f_motor_rot) < tol:
+                    label = f'{n}× motor rot' if n > 1 else 'motor rot'
+                    break
+
+        # Platter rotation harmonics (always available)
+        if label is None:
+            for n in range(1, 20):
+                if abs(f - n * f_rot) < tol:
+                    label = f'{n}× rotation' if n > 1 else 'rotation'
+                    break
+
+        peak['label'] = label
+
+
+# ========================= AM/FM COUPLING =========================
+
+def _compute_coupling_at_freq(am_full, fm_full, fs, freq):
+    """
+    Compute coupling strength at one frequency using sosfiltfilt Butterworth
+    bandpass — ported directly from fg_coupling_strength.py.
+
+    Returns: strength (R × sig), R, sig, phase_deg
+    """
+    nyq = fs / 2.0
+    bw = max(0.15, freq * 0.3)
+    lo = max(0.2, freq - bw)
+    hi = min(freq + bw, nyq * 0.9)
+    if hi <= lo:
+        return 0.0, 0.0, 0.0, 0.0
+
+    sos = butter(4, [lo / nyq, hi / nyq], btype='band', output='sos')
+    am_band = sosfiltfilt(sos, am_full)
+    fm_band = sosfiltfilt(sos, fm_full)
+
+    # Skip edges (3s each side)
+    skip = int(3.0 * fs)
+    if len(am_band) <= 2 * skip:
+        return 0.0, 0.0, 0.0, 0.0
+    am_band = am_band[skip:-skip]
+    fm_band = fm_band[skip:-skip]
+
+    # Signal amplitude: geometric mean of AM and FM RMS (%)
+    am_rms = np.std(am_band)
+    fm_rms = np.std(fm_band)
+    sig = np.sqrt(am_rms * fm_rms)
+
+    if sig < 1e-12:
+        return 0.0, 0.0, 0.0, 0.0
+
+    # Phase lock R
+    am_a = hilbert(am_band)
+    fm_a = hilbert(fm_band)
+    dphi = np.angle(fm_a) - np.angle(am_a)
+    resultant = np.mean(np.exp(1j * dphi))
+    R = float(np.abs(resultant))
+    phase_deg = float(np.degrees(np.angle(resultant)))
+
+    return R * sig, R, sig, phase_deg
+
+
+def _find_coupling_freqs(am_full, fm_full, fs, max_freq=50.0, n_peaks=8):
+    """
+    Find data-driven test frequencies from peaks in both AM and FM spectra.
+    Ported from fg_am_fm_phase.py collect_sweep_freqs / find_spectral_peaks.
+
+    Returns sorted, deduplicated list of frequencies.
+    """
+    def _spectral_peaks(signal, fs, min_freq=0.3, max_freq=50.0, n_peaks=8):
+        N = len(signal)
+        win = np.hanning(N)
+        sig_ac = signal - np.mean(signal)
+        spec = np.abs(np.fft.rfft(sig_ac * win)) * 2.0 / np.sum(win)
+        freqs = np.fft.rfftfreq(N, d=1.0 / fs)
+
+        mask = (freqs >= min_freq) & (freqs <= max_freq)
+        spec_m = spec.copy()
+        spec_m[~mask] = 0
+
+        threshold = np.max(spec_m) * 0.05
+        dist = max(1, int(0.15 / (freqs[1] - freqs[0])))
+        pk_idx, _ = _find_peaks(spec_m, height=threshold, distance=dist)
+
+        pk_idx = sorted(pk_idx, key=lambda i: spec[i], reverse=True)[:n_peaks]
+        return sorted([float(freqs[i]) for i in pk_idx])
+
+    am_peaks = _spectral_peaks(am_full, fs, max_freq=max_freq, n_peaks=n_peaks)
+    fm_peaks = _spectral_peaks(fm_full, fs, max_freq=max_freq, n_peaks=n_peaks)
+
+    all_freqs = sorted(set(am_peaks + fm_peaks))
+
+    # Deduplicate: merge frequencies within 0.1 Hz
+    merged = []
+    for f in all_freqs:
+        if not merged or abs(f - merged[-1]) > 0.1:
+            merged.append(f)
+        else:
+            merged[-1] = (merged[-1] + f) / 2.0
+
+    return sorted(merged)
+
+
+def _compute_coupling_markers(peaks, am_full, fm_full, fs):
+    """
+    Compute coupling strength at data-driven frequencies found in both
+    AM and FM spectra, plus rotation harmonics when rpm is known.
+    Ported from fg_coupling_strength.py.
+
+    Mutates peaks in-place (sets coupling_strength, am_coupled).
+    Returns coupling_threshold.
+    """
+    # Stash full signals for on-demand lissajous
+    _state['_am_full'] = am_full
+    _state['_fm_full'] = fm_full
+
+    # Find test frequencies from AM/FM spectra
+    test_freqs = _find_coupling_freqs(am_full, fm_full, fs)
+
+    # Compute coupling at each test frequency
+    freq_strengths = {}  # freq -> (strength, R, sig, phase)
+    for freq in test_freqs:
+        strength, R, sig, phase = _compute_coupling_at_freq(
+            am_full, fm_full, fs, freq)
+        freq_strengths[freq] = (strength, R, sig, phase)
+
+    # Significance threshold: 3× median of all coupling values.
+    # This matches fg_coupling_strength.py exactly.
+    all_strengths = [v[0] for v in freq_strengths.values()]
+    if len(all_strengths) > 1:
+        median_val = float(np.median(all_strengths))
+        threshold = _COUPLING_SIG_MULT * median_val
+    else:
+        threshold = 0.0
+
+    # Match each spectrum peak to the nearest test frequency (within tolerance)
+    # and assign its coupling values.
+    for peak in peaks:
+        pf = peak['freq']
+        best_freq = None
+        best_dist = float('inf')
+        for tf in test_freqs:
+            d = abs(pf - tf)
+            if d < best_dist:
+                best_dist = d
+                best_freq = tf
+        # Match tolerance: within 0.15 Hz or 15% of freq, whichever is larger
+        tol = max(0.15, pf * 0.15)
+        if best_freq is not None and best_dist <= tol:
+            s, R, sig, phase = freq_strengths[best_freq]
+            peak['coupling_strength'] = float(s)
+            peak['am_coupled'] = (s > threshold) if threshold > 0 else False
+        else:
+            peak['coupling_strength'] = None
+            peak['am_coupled'] = False
+
+    return float(threshold) if threshold > 0 else None
+
+
+# ========================= DEVICE INPUT =========================
+
+def _detect_device_format(text_data):
+    """
+    Detect device format from text content.
+    Returns format string or None.
+    """
+    # ShakNSpin: semicolon-delimited, header contains known keys
+    lines = text_data.split('\n')[:25]
+    shaknspin_keys = {'Session', 'Avg Speed', 'W&F peak', 'W&F DIN'}
+    found = 0
+    for line in lines:
+        parts = line.strip().split(';')
+        if len(parts) >= 2:
+            key = parts[0].strip().rstrip(':')
+            if key in shaknspin_keys:
+                found += 1
+    if found >= 2:
+        return 'shaknspin'
+
+    return None
+
+
+def _parse_shaknspin_text(text_data):
+    """
+    Parse ShakNSpin text export from string.
+
+    Returns dict:
+        time_s: numpy array of time in seconds
+        deviation_pct: numpy array of speed deviation in %
+        sample_rate: float (Hz)
+        f_mean: float (mean rotation frequency in Hz)
+        metadata: dict with header fields
+        device_label: str (session/serial for display)
+    """
+    lines = text_data.split('\n')
+
+    # Header
+    header = {}
+    for line in lines[:25]:
+        parts = line.strip().split(';')
+        if len(parts) == 2:
+            header[parts[0].strip().rstrip(':')] = parts[1].strip()
+
+    # Time-domain trace: columns 0–1 (Time;Speed) are present in every data
+    # row.  4-column rows carry extra Freq;Magnitude for the spectrum but
+    # the speed trace is continuous across both sections (0 – ~8000 ms).
+    td_time = []
+    td_speed = []
+    for line in lines[26:]:
+        parts = line.strip().split(';')
+        if len(parts) >= 2:
+            try:
+                td_time.append(float(parts[0]))
+                td_speed.append(float(parts[1]))
+            except ValueError:
+                continue
+
+    time_ms = np.array(td_time)
+    time_s = time_ms / 1000.0
+    speed_rpm = np.array(td_speed)
+
+    if len(time_ms) < 2:
+        raise ValueError("ShakNSpin data has fewer than 2 time samples")
+
+    fs = 1000.0 / (time_ms[1] - time_ms[0])
+    nominal_rpm = np.mean(speed_rpm)
+    f_mean = nominal_rpm / 60.0
+    deviation_pct = (speed_rpm - nominal_rpm) / nominal_rpm * 100.0
+
+    # Device label: session name if available
+    device_label = header.get('Session', None)
+    if device_label and '.CSV' in device_label:
+        device_label = device_label.replace('.CSV', '')
+
+    return {
+        'time_s': time_s,
+        'deviation_pct': deviation_pct,
+        'sample_rate': fs,
+        'f_mean': f_mean,
+        'metadata': header,
+        'device_label': device_label,
+    }
+
+
+def _parse_device_data(text_data, fmt):
+    """Dispatch to format-specific parser."""
+    if fmt == 'shaknspin':
+        return _parse_shaknspin_text(text_data)
+    raise ValueError(f"Unknown device format: {fmt}")
+
+
+# ========================= MAIN API =========================
+
+def analyzeFull(data, sampleRate=None, inputType='audio',
+                rpm=None, motor_slots=None, motor_poles=None,
+                drive_ratio=1.0):
+    """
+    Single entry point for all analysis. Sync wrapper — detects whether
+    an event loop is running (Pyodide) and returns a coroutine for await,
+    otherwise runs synchronously (CLI).
+
+    Parameters:
+        data: PCM float64 array (audio) or text string (device)
+        sampleRate: required for audio, ignored for device
+        inputType: 'audio' or 'device'
+        rpm: platter/transport RPM (optional). Enables polar plot and
+             rotation harmonic labeling. For device input, extracted
+             from data automatically but can be overridden.
+        motor_slots: number of motor stator slots (optional). Enables
+                     slot passing harmonic labels. Requires rpm.
+        motor_poles: number of motor poles (optional). Enables electrical
+                     and torque ripple harmonic labels. Requires rpm.
+        drive_ratio: motor-to-platter speed ratio for non-direct-drive
+                     (default 1.0 = direct drive).
+
+    Returns structured result dict per SPA integration plan.
+    """
+    import asyncio
+
+    coro = _analyzeFull_async(data, sampleRate=sampleRate, inputType=inputType,
+                               rpm=rpm, motor_slots=motor_slots,
+                               motor_poles=motor_poles, drive_ratio=drive_ratio)
+
+    # In Pyodide (or any running event loop), return the coroutine for await.
+    # In CLI (no event loop), run synchronously.
+    try:
+        loop = asyncio.get_running_loop()
+        return coro  # caller must await
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
+                              rpm=None, motor_slots=None, motor_poles=None,
+                              drive_ratio=1.0):
+    """Async implementation of analyzeFull."""
+    _clear_state()
+
+    # Stash motor params for use in sub-functions
+    _state['_rpm'] = rpm
+    _state['_motor_slots'] = motor_slots
+    _state['_motor_poles'] = motor_poles
+    _state['_drive_ratio'] = drive_ratio
+
+    if inputType == 'device':
+        return await _analyze_device(data, rpm=rpm)
+    else:
+        if sampleRate is None:
+            raise ValueError("sampleRate is required for audio input")
+        return await _analyze_audio(data, sampleRate)
+
+
+async def _analyze_audio(pcm_data, sample_rate):
+    """Full audio pipeline."""
+    fs = sample_rate
+    sig = np.asarray(pcm_data, dtype=np.float64)
+    duration = len(sig) / fs
+
+    await _status(f"Loaded: {duration:.1f}s at {fs} Hz")
+
+    # 1. Carrier frequency
+    await _status("Detecting carrier frequency...")
+    f_est = _estimate_carrier_freq(sig, fs)
+
+
+    # 2. Bandpass prefilter
+    await _status("Applying prefilter...")
+    if PREFILTER_BW_FACTOR is not None and f_est > 0:
+        bw_hz = f_est * PREFILTER_BW_FACTOR
+        MAX_BW_HZ = 150.0
+        if f_est > 500 and bw_hz > MAX_BW_HZ:
+            bw_hz = MAX_BW_HZ
+        bp_low = max(f_est - bw_hz, 1.0)
+        bp_high = min(f_est + bw_hz, fs / 2.0 * 0.95)
+        sig_filtered = _bandpass_prefilter(sig, fs, bp_low, bp_high,
+                                            order=PREFILTER_ORDER)
+    else:
+        sig_filtered = sig
+        bw_hz = None
+
+
+    # 3. Zero crossings
+    await _status("Finding zero crossings...")
+    crossing_times = _find_zero_crossings(sig_filtered, fs)
+
+
+    if len(crossing_times) < 3:
+        raise ValueError(
+            f"Only {len(crossing_times)} zero crossings found. "
+            "No valid carrier signal detected in the audio."
+        )
+
+    # 4. Per-cycle frequency
+    t_freq, freq = _crossings_to_frequency(crossing_times)
+
+    # 5. Edge trim + outlier rejection + despike
+    await _status("Cleaning frequency data...")
+    if PREFILTER_BW_FACTOR is not None:
+        t_freq, freq = _edge_trim(t_freq, freq, prefilter_bw_hz=bw_hz)
+    t_freq, freq, n_rejected = _outlier_reject(t_freq, freq)
+    freq = _median_despike(t_freq, freq)
+
+
+    f_mean = float(np.mean(freq))
+
+    # 6. Smooth + interpolate to uniform grid
+    await _status("Interpolating to uniform grid...")
+    freq_smooth = _smooth_frequency(freq, SMOOTH_CYCLES)
+    t_uniform, f_uniform, output_rate = _interpolate_to_uniform(
+        t_freq, freq_smooth)
+
+
+    # Deviation
+    deviation_frac = (f_uniform - f_mean) / f_mean
+    deviation_pct = deviation_frac * 100.0
+
+    # 7. Metrics
+    await _status("Computing metrics...")
+    standard, non_standard = _compute_wf_metrics(deviation_frac, output_rate, f_est)
+
+
+    # 8. Spectrum + peaks
+    await _status("Computing spectrum...")
+    spectrum = _compute_spectrum(deviation_pct, output_rate,
+                                 max_freq=bw_hz if bw_hz else 50.0)
+
+
+    # Motor harmonic labels (conditional on rpm)
+    rpm = _state.get('_rpm')
+    f_rot = rpm / 60.0 if rpm is not None else None
+    _identify_motor_harmonics(spectrum['peaks'], f_rot,
+                               motor_slots=_state.get('_motor_slots'),
+                               motor_poles=_state.get('_motor_poles'),
+                               drive_ratio=_state.get('_drive_ratio', 1.0))
+
+    # 9. AM/FM coupling markers
+    await _status("Computing AM/FM coupling...")
+    # AM envelope from prefiltered signal via Hilbert — normalized to percent
+    # deviation from mean, matching the purpose-built coupling analysis.
+    # Decimate before Hilbert: AM content is <50 Hz, so ~500 Hz target rate
+    # is plenty. Reduces FFT from ~8.8M to ~46k samples in Pyodide.
+    dec_factor = max(1, int(fs // 500))
+    if dec_factor > 1:
+        sig_dec = decimate(sig_filtered, dec_factor, ftype='fir')
+        fs_dec = fs / dec_factor
+    else:
+        sig_dec = sig_filtered
+        fs_dec = fs
+    am_envelope = np.abs(hilbert(sig_dec))
+    # Trim 1s edges (Hilbert artifact), then normalize to percent
+    trim_am = int(1.0 * fs_dec)
+    am_trimmed = am_envelope[trim_am:-trim_am] if len(am_envelope) > 2 * trim_am else am_envelope
+    am_mean = np.mean(am_trimmed)
+    am_pct = (am_trimmed - am_mean) / am_mean * 100.0
+    # Resample AM (percent) to match deviation grid
+    am_t_raw = np.arange(len(am_pct)) / fs_dec + (trim_am / fs_dec)
+    am_resampled = np.interp(t_uniform, am_t_raw, am_pct)
+
+    coupling_threshold = _compute_coupling_markers(
+        spectrum['peaks'], am_resampled, deviation_pct, output_rate)
+    _state['_am_envelope'] = am_resampled
+    _state['_fm_deviation'] = deviation_pct
+    spectrum['coupling_threshold'] = coupling_threshold
+    _state['_coupling_threshold'] = coupling_threshold
+
+
+    # Stash state for getPlotData
+    _state['_deviation_pct'] = deviation_pct
+    _state['_t_uniform'] = t_uniform
+    _state['_output_rate'] = output_rate
+    _state['_f_mean'] = f_mean
+    _state['_f_rot'] = f_rot
+    _state['_input_type'] = 'audio'
+
+    # Available on-demand plots
+    available = {
+        'histogram': {},
+        'harmonic_extract': {},
+        'lissajous': {},
+    }
+
+    # Polar requires rpm (need rotation period to define one revolution)
+    if f_rot is not None and f_rot > 0:
+        sec_per_rev = 1.0 / f_rot
+        samples_per_rev = int(round(sec_per_rev * output_rate))
+        max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
+        available['polar'] = {'max_revolutions': max_revolutions}
+
+    await _status("Complete")
+
+    return {
+        'metrics': {
+            'f_mean': f_mean,
+            'carrier_freq': float(f_est),
+            'rpm': float(rpm) if rpm is not None else None,
+            'f_rot': float(f_rot) if f_rot is not None else None,
+            'duration': float(duration),
+            'input_type': 'audio',
+            'device_format': None,
+            'device_label': None,
+            'standard': standard,
+            'non_standard': non_standard,
+        },
+        'plots': {
+            'dev_time': {
+                't': t_uniform.tolist(),
+                'deviation_pct': deviation_pct.tolist(),
+            },
+            'spectrum': spectrum,
+        },
+        'available': available,
+    }
+
+
+async def _analyze_device(text_data, rpm=None):
+    """Device input pipeline — enters at deviation stage."""
+    await _status("Detecting device format...")
+    fmt = _detect_device_format(text_data)
+    if fmt is None:
+        raise ValueError(
+            "Unable to detect device format from text data. "
+            "Supported formats: ShakNSpin"
+        )
+
+    _status(f"Parsing {fmt} data...")
+    parsed = _parse_device_data(text_data, fmt)
+
+    time_s = parsed['time_s']
+    deviation_pct = parsed['deviation_pct']
+    fs = parsed['sample_rate']
+    f_mean = parsed['f_mean']
+    duration = float(time_s[-1] - time_s[0])
+    deviation_frac = deviation_pct / 100.0
+
+    # RPM: use override if provided, otherwise derive from parsed data
+    if rpm is None:
+        # Device data provides RPM via f_mean (which is RPM/60 for device)
+        rpm = f_mean * 60.0
+    f_rot = rpm / 60.0
+    _state['_rpm'] = rpm
+
+    # Metrics
+    await _status("Computing metrics...")
+    # Device path has no carrier — use 200 Hz upper limit (AES6 equipment spec)
+    standard, non_standard = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
+
+    # Spectrum
+    await _status("Computing spectrum...")
+    spectrum = _compute_spectrum(deviation_pct, fs, max_freq=50.0)
+
+    # Motor harmonic labels
+    _identify_motor_harmonics(spectrum['peaks'], f_rot,
+                               motor_slots=_state.get('_motor_slots'),
+                               motor_poles=_state.get('_motor_poles'),
+                               drive_ratio=_state.get('_drive_ratio', 1.0))
+
+    # No coupling for device input
+    # spectrum peaks already have coupling_strength=None, am_coupled=False
+
+    # Stash state for getPlotData
+    _state['_deviation_pct'] = deviation_pct
+    _state['_t_uniform'] = time_s
+    _state['_output_rate'] = fs
+    _state['_f_mean'] = f_mean
+    _state['_f_rot'] = f_rot
+    _state['_input_type'] = 'device'
+
+    # Available on-demand plots
+    available = {
+        'histogram': {},
+        'harmonic_extract': {},
+        # No lissajous for device input
+    }
+
+    # Polar requires rpm (always available for device since we have RPM)
+    if f_rot is not None and f_rot > 0:
+        sec_per_rev = 1.0 / f_rot
+        samples_per_rev = int(round(sec_per_rev * fs))
+        max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
+        available['polar'] = {'max_revolutions': max_revolutions}
+
+    await _status("Complete")
+
+    return {
+        'metrics': {
+            'f_mean': f_mean,
+            'carrier_freq': None,
+            'rpm': float(rpm),
+            'f_rot': float(f_rot),
+            'duration': duration,
+            'input_type': 'device',
+            'device_format': fmt,
+            'device_label': parsed.get('device_label'),
+            'standard': standard,
+            'non_standard': non_standard,
+        },
+        'plots': {
+            'dev_time': {
+                't': time_s.tolist(),
+                'deviation_pct': deviation_pct.tolist(),
+            },
+            'spectrum': spectrum,
+        },
+        'available': available,
+    }
+
+
+# ========================= ON-DEMAND PLOT DATA =========================
+
+def getPlotData(plotId, params=None):
+    """
+    Returns arrays for the requested on-demand plot.
+    Requires analyzeFull to have been called first.
+
+    Parameters:
+        plotId: str — one of 'polar', 'histogram', 'harmonic_extract', 'lissajous'
+        params: dict — plot-specific parameters
+
+    Returns plot-specific dict.
+    """
+    if params is None:
+        params = {}
+
+    if not _state:
+        raise RuntimeError("No analysis data. Call analyzeFull first.")
+
+    if plotId == 'polar':
+        return _plot_polar(params)
+    elif plotId == 'histogram':
+        return _plot_histogram(params)
+    elif plotId == 'harmonic_extract':
+        return _plot_harmonic_extract(params)
+    elif plotId == 'lissajous':
+        return _plot_lissajous(params)
+    else:
+        raise ValueError(f"Unknown plotId: {plotId}")
+
+
+def _plot_polar(params):
+    """
+    Polar plot data. Starts at revolution 0 (no skip).
+
+    params:
+        revolutions: int (default 2)
+    """
+    f_rot = _state.get('_f_rot')
+    if f_rot is None or f_rot <= 0:
+        raise ValueError("Polar plot requires rpm (rotation frequency unknown)")
+
+    revolutions = params.get('revolutions', 2)
+    deviation_pct = _state['_deviation_pct']
+    output_rate = _state['_output_rate']
+    f_mean = _state['_f_mean']
+
+    sec_per_rev = 1.0 / f_rot
+    samples_per_rev = int(round(sec_per_rev * output_rate))
+
+    inst_freq = f_mean * (1.0 + deviation_pct / 100.0)
+
+    # No skip — preconditioning handles filter artifacts
+    start_idx = 0
+    end_idx = min(revolutions * samples_per_rev, len(inst_freq))
+    actual_revs = (end_idx - start_idx) // samples_per_rev
+
+    # Theta: one revolution = 2π
+    theta = np.linspace(0, 2 * np.pi, samples_per_rev, endpoint=False)
+
+    revs_data = []
+    for rev in range(actual_revs):
+        idx_start = start_idx + rev * samples_per_rev
+        idx_end = idx_start + samples_per_rev
+        if idx_end > len(inst_freq):
+            break
+        revs_data.append({
+            'angle': theta.tolist(),
+            'radius': inst_freq[idx_start:idx_end].tolist(),
+        })
+
+    return {
+        'revolutions': revs_data,
+        'f_mean': f_mean,
+        'n_revolutions': len(revs_data),
+    }
+
+
+def _plot_histogram(params):
+    """Deviation histogram data."""
+    deviation_pct = _state['_deviation_pct']
+    counts, bin_edges = np.histogram(deviation_pct, bins=256, density=True)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    return {
+        'bins': bin_centers.tolist(),
+        'counts': counts.tolist(),
+        'bin_edges': bin_edges.tolist(),
+    }
+
+
+def _plot_harmonic_extract(params):
+    """
+    Bandpassed deviation at each requested frequency.
+
+    params:
+        freqs: list of float (Hz)
+    """
+    freqs = params.get('freqs', [])
+    if not freqs:
+        return {'components': []}
+
+    deviation_pct = _state['_deviation_pct']
+    output_rate = _state['_output_rate']
+    f_mean = _state['_f_mean']
+
+    components = []
+    for freq in freqs:
+        nyquist = output_rate / 2.0
+        if freq >= nyquist:
+            components.append([])
+            continue
+
+        bw = min(f_mean * 0.8, max(0.3, freq * 0.05))
+        lo = max(freq - bw / 2, 0.05)
+        hi = min(freq + bw / 2, nyquist * 0.95)
+
+        if hi <= lo:
+            components.append([])
+            continue
+
+        sos = butter(4, [lo / nyquist, hi / nyquist],
+                     btype='bandpass', output='sos')
+        comp = sosfiltfilt(sos, deviation_pct)
+        components.append(comp.tolist())
+
+    return {'components': components}
+
+
+def _plot_lissajous(params):
+    """
+    AM/FM Lissajous data at one frequency. Audio only.
+    Uses sosfiltfilt Butterworth bandpass — same method as coupling markers.
+
+    params:
+        freq: float (Hz)
+    """
+    if _state.get('_input_type') != 'audio':
+        raise ValueError("Lissajous requires audio input (AM envelope needed)")
+
+    freq = params.get('freq')
+    if freq is None:
+        raise ValueError("freq parameter required for lissajous")
+
+    am_full = _state.get('_am_full')
+    fm_full = _state.get('_fm_full')
+    fs = _state['_output_rate']
+
+    if am_full is None or fm_full is None:
+        raise RuntimeError("Coupling data not available. "
+                          "Was analyzeFull called with audio input?")
+
+    # sosfiltfilt Butterworth bandpass — matches coupling_strength()
+    nyq = fs / 2.0
+    bw = max(0.15, freq * 0.3)
+    lo = max(0.2, freq - bw)
+    hi = min(freq + bw, nyq * 0.9)
+    if hi <= lo:
+        raise ValueError(f"Bandpass range invalid for freq={freq}")
+
+    sos = butter(4, [lo / nyq, hi / nyq], btype='band', output='sos')
+    am_band = sosfiltfilt(sos, am_full)
+    fm_band = sosfiltfilt(sos, fm_full)
+
+    # Skip edges
+    skip = int(3.0 * fs)
+    if len(am_band) > 2 * skip:
+        am_band = am_band[skip:-skip]
+        fm_band = fm_band[skip:-skip]
+
+    # Normalize to peak
+    am_peak = np.max(np.abs(am_band)) if np.max(np.abs(am_band)) > 0 else 1.0
+    fm_peak = np.max(np.abs(fm_band)) if np.max(np.abs(fm_band)) > 0 else 1.0
+    am_norm = am_band / am_peak
+    fm_norm = fm_band / fm_peak
+
+    # Phase stats
+    am_a = hilbert(am_band)
+    fm_a = hilbert(fm_band)
+    dphi = np.angle(fm_a) - np.angle(am_a)
+    resultant = np.mean(np.exp(1j * dphi))
+    R = float(np.abs(resultant))
+    phase = float(np.degrees(np.angle(resultant)))
+
+    am_rms = np.std(am_band)
+    fm_rms = np.std(fm_band)
+    strength = float(R * np.sqrt(am_rms * fm_rms))
+
+    # Check significance against the threshold computed during analyzeFull
+    coupling_threshold = _state.get('_coupling_threshold', None)
+    significant = (coupling_threshold is not None and
+                   strength > coupling_threshold)
+
+    return {
+        'am_norm': am_norm.tolist(),
+        'fm_norm': fm_norm.tolist(),
+        'R': R,
+        'phase': phase,
+        'strength': strength,
+        'significant': significant,
+    }
