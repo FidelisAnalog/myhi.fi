@@ -521,6 +521,94 @@ def _compute_spectrum(deviation_pct, output_rate, max_freq=50.0,
     }
 
 
+# ========================= RPM AUTO-DETECTION =========================
+
+# Standard platter speeds: (nominal RPM, rotation frequency Hz)
+_STANDARD_SPEEDS = [
+    (16.67, 16.67 / 60.0),   # half-speed 33⅓
+    (22.50, 22.50 / 60.0),   # half-speed 45
+    (33.33, 33.33 / 60.0),   # standard LP
+    (45.00, 45.00 / 60.0),   # standard single
+    (78.26, 78.26 / 60.0),   # shellac
+]
+
+_RPM_TOLERANCE = 0.05        # ±5% of nominal f_rot
+_RPM_MIN_FREQ = 0.20         # Hz — below this is DC drift, not rotation
+_RPM_MAX_FREQ = 2.0          # Hz — above this is not a platter speed
+_RPM_HIGH_SNR = 10.0         # peak / median for high confidence
+_RPM_MED_SNR = 5.0           # peak / median for medium confidence
+_RPM_STD_LOW_SNR = 3.0       # accept lower SNR if very close to standard speed
+_RPM_STD_CLOSE_TOL = 0.01    # ±1% for low-SNR standard match
+_RPM_MIN_DURATION = 4.0      # seconds — minimum file length for detection
+
+
+def _detect_rpm(spectrum_freqs, spectrum_amp, duration):
+    """
+    Detect platter RPM from FM deviation spectrum.
+
+    Checks amplitude at each standard rotation frequency directly.
+    Returns the standard speed with the best SNR above threshold.
+
+    Returns dict: {value, source, confidence, f_rot_measured} or
+    {value: None, source: None, confidence: None, f_rot_measured: None}
+    """
+    no_detect = {'value': None, 'source': None, 'confidence': None,
+                 'f_rot_measured': None}
+
+    if duration < _RPM_MIN_DURATION:
+        return no_detect
+
+    freqs = np.asarray(spectrum_freqs)
+    amp = np.asarray(spectrum_amp)
+
+    if len(freqs) < 3:
+        return no_detect
+
+    df = float(freqs[1] - freqs[0])
+
+    # Compute noise floor excluding bins near standard speeds
+    det_mask = (freqs >= _RPM_MIN_FREQ) & (freqs <= _RPM_MAX_FREQ)
+    noise_mask = det_mask.copy()
+    for _, nominal_frot in _STANDARD_SPEEDS:
+        bin_idx = int(round((nominal_frot - freqs[0]) / df))
+        exclude = max(1, int(round(nominal_frot * _RPM_TOLERANCE / df)))
+        lo = max(0, bin_idx - exclude)
+        hi = min(len(freqs), bin_idx + exclude + 1)
+        noise_mask[lo:hi] = False
+    if np.any(noise_mask):
+        median_noise = float(np.median(amp[noise_mask]))
+    else:
+        median_noise = float(np.median(amp[det_mask]))
+    if median_noise <= 0:
+        return no_detect
+
+    best_score = 0
+    best_result = None
+
+    for nominal_rpm, nominal_frot in _STANDARD_SPEEDS:
+        # Find nearest bin and check ±1 bin for peak
+        bin_idx = int(round((nominal_frot - freqs[0]) / df))
+        if bin_idx < 1 or bin_idx >= len(amp) - 1:
+            continue
+        peak_amp = float(max(amp[bin_idx - 1], amp[bin_idx], amp[bin_idx + 1]))
+        peak_bin = bin_idx + int(np.argmax(amp[bin_idx - 1:bin_idx + 2])) - 1
+        snr = peak_amp / median_noise
+        closeness = 1.0 - abs(float(freqs[peak_bin]) - nominal_frot) / nominal_frot
+        score = snr * max(closeness, 0.0)
+
+        if snr >= _RPM_STD_LOW_SNR and score > best_score:
+            best_score = score
+            confidence = min(1.0, snr / _RPM_HIGH_SNR)
+            best_result = {
+                'value': nominal_rpm,
+                'source': 'detected',
+                'confidence': round(confidence, 2),
+                'f_rot_measured': round(float(freqs[peak_bin]), 4),
+            }
+
+    return best_result if best_result is not None else no_detect
+
+
 # ========================= MOTOR HARMONIC IDENTIFICATION =========================
 
 def _identify_motor_harmonics(peaks, f_rot, motor_slots=None,
@@ -969,9 +1057,25 @@ async def _analyze_audio(pcm_data, sample_rate):
                                  max_freq=bw_hz if bw_hz else 50.0)
 
 
-    # Motor harmonic labels (conditional on rpm)
-    rpm = _state.get('_rpm')
+    # RPM: use user-provided, or auto-detect from spectrum
+    user_rpm = _state.get('_rpm')
+    if user_rpm is not None:
+        rpm = user_rpm
+        rpm_info = {
+            'value': float(user_rpm),
+            'source': 'user',
+            'confidence': 1.0,
+            'f_rot_measured': round(user_rpm / 60.0, 4),
+        }
+    else:
+        rpm_info = _detect_rpm(spectrum['freqs'], spectrum['amplitude'], duration)
+        rpm = rpm_info['value']
+
     f_rot = rpm / 60.0 if rpm is not None else None
+    _state['_rpm'] = rpm
+    _state['_f_rot'] = f_rot
+
+    # Motor harmonic labels (conditional on rpm)
     _identify_motor_harmonics(spectrum['peaks'], f_rot,
                                motor_slots=_state.get('_motor_slots'),
                                motor_poles=_state.get('_motor_poles'),
@@ -1036,8 +1140,7 @@ async def _analyze_audio(pcm_data, sample_rate):
         'metrics': {
             'f_mean': f_mean,
             'carrier_freq': float(f_est),
-            'rpm': float(rpm) if rpm is not None else None,
-            'f_rot': float(f_rot) if f_rot is not None else None,
+            'rpm': rpm_info,
             'duration': float(duration),
             'input_type': 'audio',
             'device_format': None,
