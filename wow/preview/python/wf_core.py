@@ -4,7 +4,7 @@ wf_core — Wow & Flutter Analysis Engine
 Single analysis engine for turntable FG signal analysis.
 Supports two input types:
   - Audio PCM (FG signal from turntable motor)
-  - Device text exports (e.g. ShakNSpin)
+  - Device text exports (e.g. shaknspin)
 
 API:
   analyzeFull(data, sampleRate=None, inputType='audio')  → full result dict
@@ -836,7 +836,7 @@ def _detect_device_format(text_data):
     Detect device format from text content.
     Returns format string or None.
     """
-    # ShakNSpin: semicolon-delimited, header contains known keys
+    # shaknspin: semicolon-delimited, header contains known keys
     lines = text_data.split('\n')[:25]
     shaknspin_keys = {'Session', 'Avg Speed', 'W&F peak', 'W&F DIN'}
     found = 0
@@ -854,7 +854,7 @@ def _detect_device_format(text_data):
 
 def _parse_shaknspin_text(text_data):
     """
-    Parse ShakNSpin text export from string.
+    Parse shaknspin text export from string.
 
     Returns dict:
         time_s: numpy array of time in seconds
@@ -892,7 +892,7 @@ def _parse_shaknspin_text(text_data):
     speed_rpm = np.array(td_speed)
 
     if len(time_ms) < 2:
-        raise ValueError("ShakNSpin data has fewer than 2 time samples")
+        raise ValueError("shaknspin data has fewer than 2 time samples")
 
     fs = 1000.0 / (time_ms[1] - time_ms[0])
     nominal_rpm = np.mean(speed_rpm)
@@ -1166,10 +1166,10 @@ async def _analyze_device(text_data, rpm=None):
     if fmt is None:
         raise ValueError(
             "Unable to detect device format from text data. "
-            "Supported formats: ShakNSpin"
+            "Supported formats: shaknspin"
         )
 
-    _status(f"Parsing {fmt} data...")
+    await _status(f"Parsing {fmt} data...")
     parsed = _parse_device_data(text_data, fmt)
 
     time_s = parsed['time_s']
@@ -1179,21 +1179,33 @@ async def _analyze_device(text_data, rpm=None):
     duration = float(time_s[-1] - time_s[0])
     deviation_frac = deviation_pct / 100.0
 
-    # RPM: use override if provided, otherwise derive from parsed data
-    if rpm is None:
-        # Device data provides RPM via f_mean (which is RPM/60 for device)
-        rpm = f_mean * 60.0
-    f_rot = rpm / 60.0
-    _state['_rpm'] = rpm
-
     # Metrics
     await _status("Computing metrics...")
-    # Device path has no carrier — use 200 Hz upper limit (AES6 equipment spec)
+    # Device path has no carrier — use 500 Hz for weighting filter
     standard, non_standard = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
 
     # Spectrum
     await _status("Computing spectrum...")
     spectrum = _compute_spectrum(deviation_pct, fs, max_freq=50.0)
+
+    # RPM: use override if provided, otherwise detect from spectrum
+    if rpm is None:
+        rpm_info = _detect_rpm(spectrum['freqs'], spectrum['amplitude'], duration)
+    else:
+        rpm_info = {
+            'value': float(rpm),
+            'source': 'user',
+            'confidence': 1.0,
+            'f_rot_measured': float(rpm) / 60.0,
+        }
+
+    if rpm_info['value'] is not None:
+        rpm = rpm_info['value']
+        f_rot = rpm / 60.0
+    else:
+        rpm = None
+        f_rot = None
+    _state['_rpm'] = rpm
 
     # Motor harmonic labels
     _identify_motor_harmonics(spectrum['peaks'], f_rot,
@@ -1230,10 +1242,10 @@ async def _analyze_device(text_data, rpm=None):
 
     return {
         'metrics': {
-            'f_mean': f_mean,
-            'carrier_freq': None,
-            'rpm': float(rpm),
-            'f_rot': float(f_rot),
+            'f_mean': None,
+            'carrier_freq': 500.0,
+            'rpm': rpm_info,
+            'f_rot': float(f_rot) if f_rot else None,
             'duration': duration,
             'input_type': 'device',
             'device_format': fmt,
