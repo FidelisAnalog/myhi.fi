@@ -899,10 +899,12 @@ def _parse_shaknspin_text(text_data):
     f_mean = nominal_rpm / 60.0
     deviation_pct = (speed_rpm - nominal_rpm) / nominal_rpm * 100.0
 
-    # Device label: session name if available
-    device_label = header.get('Session', None)
-    if device_label and '.CSV' in device_label:
-        device_label = device_label.replace('.CSV', '')
+    # Device label: serial number if available, fall back to session
+    device_label = header.get('Device', None)
+    if device_label is None:
+        device_label = header.get('Session', None)
+        if device_label and '.CSV' in device_label:
+            device_label = device_label.replace('.CSV', '')
 
     return {
         'time_s': time_s,
