@@ -347,6 +347,51 @@ def _metric(value, confidence=0):
     return {'value': float(value), 'confidence': int(confidence)}
 
 
+_DESPIKE_PLOT_RATE = 3000  # SRC target for plot despike — consistent kernel behaviour
+
+
+def _despike_plot(dev_pct, src_rate, despike_ms, t_array):
+    """SRC plot data to a common rate, apply median despike, return despiked data + new t.
+
+    Parameters
+    ----------
+    dev_pct : ndarray — deviation in percent at src_rate
+    src_rate : float — native sample rate of dev_pct
+    despike_ms : float — despike window in ms (0 = off)
+    t_array : ndarray — time axis at native rate
+
+    Returns
+    -------
+    (dev_out, t_out, plot_rate) — despiked deviation, time axis, output sample rate
+    """
+    from math import gcd
+
+    target = _DESPIKE_PLOT_RATE
+
+    if despike_ms <= 0 or src_rate <= 0:
+        return dev_pct, t_array, src_rate
+
+    # SRC to target rate
+    up = target
+    down = int(round(src_rate))
+    if up != down:
+        g = gcd(up, down)
+        dev_resampled = resample_poly(dev_pct, up // g, down // g)
+        t_resampled = np.linspace(t_array[0], t_array[-1], len(dev_resampled))
+    else:
+        dev_resampled = dev_pct
+        t_resampled = t_array
+
+    # Medfilt despike
+    k = int(despike_ms / 1000.0 * target)
+    if k % 2 == 0:
+        k += 1
+    k = max(3, k)
+    dev_out = medfilt(dev_resampled, kernel_size=k)
+
+    return dev_out, t_resampled, float(target)
+
+
 def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
                         unweighted_bw='virtins'):
     """
@@ -371,6 +416,7 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
     Returns:
         standard: dict of standardized metrics (AES6/DIN/IEC)
         non_standard: dict of non-standardized metrics
+        dev_unwtd: LP-filtered fractional deviation used for unweighted metrics
     """
     nyq = fs / 2.0
     n_total = len(deviation_frac)
@@ -494,7 +540,7 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
         'drift_rms':              _metric(drift_rms, conf),
     }
 
-    return standard, non_standard
+    return standard, non_standard, dev_unwtd
 
 
 # ========================= SPECTRUM =========================
@@ -956,7 +1002,7 @@ def _parse_device_data(text_data, fmt):
 
 def analyzeFull(data, sampleRate=None, inputType='audio',
                 rpm=None, motor_slots=None, motor_poles=None,
-                drive_ratio=1.0, prefilter_high=1.9):
+                drive_ratio=1.0, prefilter_high=1.9, despike_ms=5):
     """
     Single entry point for all analysis. Sync wrapper — detects whether
     an event loop is running (Pyodide) and returns a coroutine for await,
@@ -986,7 +1032,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
     coro = _analyzeFull_async(data, sampleRate=sampleRate, inputType=inputType,
                                rpm=rpm, motor_slots=motor_slots,
                                motor_poles=motor_poles, drive_ratio=drive_ratio,
-                               prefilter_high=prefilter_high)
+                               prefilter_high=prefilter_high, despike_ms=despike_ms)
 
     # In Pyodide (or any running event loop), return the coroutine for await.
     # In CLI (no event loop), run synchronously.
@@ -999,7 +1045,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
 
 async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
                               rpm=None, motor_slots=None, motor_poles=None,
-                              drive_ratio=1.0, prefilter_high=1.9):
+                              drive_ratio=1.0, prefilter_high=1.9, despike_ms=5):
     """Async implementation of analyzeFull."""
     _clear_state()
 
@@ -1010,14 +1056,14 @@ async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
     _state['_drive_ratio'] = drive_ratio
 
     if inputType == 'device':
-        return await _analyze_device(data, rpm=rpm)
+        return await _analyze_device(data, rpm=rpm, despike_ms=despike_ms)
     else:
         if sampleRate is None:
             raise ValueError("sampleRate is required for audio input")
-        return await _analyze_audio(data, sampleRate, prefilter_high=prefilter_high)
+        return await _analyze_audio(data, sampleRate, prefilter_high=prefilter_high, despike_ms=despike_ms)
 
 
-async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
+async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5):
     """Full audio pipeline — Hilbert demod with configurable prefilter."""
     fs = sample_rate
     sig = np.asarray(pcm_data, dtype=np.float64)
@@ -1055,38 +1101,48 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
         sos_lp = butter(4, lp_cut / nyq, btype='low', output='sos')
         inst_freq = sosfiltfilt(sos_lp, inst_freq)
 
-    # 5. Edge trim — Hilbert has ~0.5s startup transient; also prefilter settling
-    edge_samples = int(0.5 * fs)
-    if bw_hz is not None and bw_hz > 0:
-        prefilter_settle = int(2.0 / bw_hz * fs)
-        edge_samples = max(edge_samples, prefilter_settle)
-    if len(inst_freq) > 2 * edge_samples + 100:
-        inst_freq = inst_freq[edge_samples:-edge_samples]
-    else:
-        trim_min = min(int(0.1 * fs), len(inst_freq) // 4)
-        inst_freq = inst_freq[trim_min:-trim_min] if trim_min > 0 else inst_freq
+    # 5. Edge trim — Hilbert transient settling time
+    #    The FFT-based Hilbert has edge artifacts that decay over a few cycles
+    #    of the lowest frequency present.  After prefilter, f_low = 0.1×carrier.
+    #    We trim 3 cycles × 2× safety margin = 6 / f_low from each edge.
+    await _status("Trimming edges...")
+    n_if = len(inst_freq)
+
+    f_low = max(f_est * 0.1, 1.0)                      # lowest freq after prefilter
+    edge_time = 6.0 / f_low                             # 3 cycles × 2× margin
+    edge_samples = max(int(edge_time * fs), int(0.01 * fs))  # floor 10 ms
+    edge_samples = min(edge_samples, n_if // 4)         # never trim more than 25% per side
+
+    trim_start = edge_samples
+    trim_end = edge_samples
+    inst_freq = inst_freq[trim_start:-trim_end] if trim_end > 0 else inst_freq
+
+    edge_time_offset = trim_start / fs  # seconds into original file
 
     f_mean = float(np.mean(inst_freq))
     deviation_frac = (inst_freq - f_mean) / f_mean
     del inst_freq
 
-    # 6. Decimate — LP already serves as AA filter
+    # 7. Decimate — LP already serves as AA filter
     min_rate = max(2.0 * lp_cut, 1000.0)
     dec_factor = max(1, int(fs / min_rate))
     output_rate = float(fs / dec_factor)
     deviation_frac = deviation_frac[::dec_factor]
 
-    deviation_pct = deviation_frac * 100.0
-    t_uniform = np.arange(len(deviation_pct)) / output_rate
+    t_uniform = np.arange(len(deviation_frac)) / output_rate + edge_time_offset
 
-    # 7. Metrics
+    # 7. Metrics — returns LP-filtered deviation used for unweighted measurement
     await _status("Computing metrics...")
-    standard, non_standard = _compute_wf_metrics(deviation_frac, output_rate, f_est)
+    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, output_rate, f_est)
+
+    # Plot data: SRC to common rate + medfilt despike
+    deviation_pct, t_uniform, plot_rate = _despike_plot(
+        dev_unwtd * 100.0, output_rate, despike_ms, t_uniform)
 
     # 8. Spectrum + peaks
     await _status("Computing spectrum...")
     spec_max_freq = 0.4 * f_est if f_est > 0 else 50.0
-    spectrum = _compute_spectrum(deviation_pct, output_rate,
+    spectrum = _compute_spectrum(deviation_pct, plot_rate,
                                  max_freq=spec_max_freq)
 
     # RPM: use user-provided, or auto-detect from spectrum
@@ -1122,7 +1178,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
     # Stash state for getPlotData
     _state['_deviation_pct'] = deviation_pct
     _state['_t_uniform'] = t_uniform
-    _state['_output_rate'] = output_rate
+    _state['_output_rate'] = plot_rate
     _state['_f_mean'] = f_mean
     _state['_f_rot'] = f_rot
     _state['_input_type'] = 'audio'
@@ -1137,7 +1193,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
     # Polar requires rpm (need rotation period to define one revolution)
     if f_rot is not None and f_rot > 0:
         sec_per_rev = 1.0 / f_rot
-        samples_per_rev = int(round(sec_per_rev * output_rate))
+        samples_per_rev = int(round(sec_per_rev * plot_rate))
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
@@ -1148,6 +1204,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
             'f_mean': f_mean,
             'carrier_freq': float(f_est),
             'prefilter_high': float(prefilter_high),
+            'despike_ms': float(despike_ms),
             'rpm': rpm_info,
             'duration': float(duration),
             'input_type': 'audio',
@@ -1167,7 +1224,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
     }
 
 
-async def _analyze_device(text_data, rpm=None):
+async def _analyze_device(text_data, rpm=None, despike_ms=5):
     """Device input pipeline — enters at deviation stage."""
     await _status("Detecting device format...")
     fmt = _detect_device_format(text_data)
@@ -1190,11 +1247,15 @@ async def _analyze_device(text_data, rpm=None):
     # Metrics
     await _status("Computing metrics...")
     # Device path has no carrier — use 500 Hz for weighting filter
-    standard, non_standard = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
+    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
+
+    # Plot data: SRC to common rate + medfilt despike
+    deviation_pct, time_s, plot_rate = _despike_plot(
+        dev_unwtd * 100.0, fs, despike_ms, time_s)
 
     # Spectrum
     await _status("Computing spectrum...")
-    spectrum = _compute_spectrum(deviation_pct, fs, max_freq=50.0)
+    spectrum = _compute_spectrum(deviation_pct, plot_rate, max_freq=50.0)
 
     # RPM: use override if provided, otherwise detect from spectrum
     if rpm is None:
@@ -1227,7 +1288,7 @@ async def _analyze_device(text_data, rpm=None):
     # Stash state for getPlotData
     _state['_deviation_pct'] = deviation_pct
     _state['_t_uniform'] = time_s
-    _state['_output_rate'] = fs
+    _state['_output_rate'] = plot_rate
     _state['_f_mean'] = f_mean
     _state['_f_rot'] = f_rot
     _state['_input_type'] = 'device'
@@ -1242,7 +1303,7 @@ async def _analyze_device(text_data, rpm=None):
     # Polar requires rpm (always available for device since we have RPM)
     if f_rot is not None and f_rot > 0:
         sec_per_rev = 1.0 / f_rot
-        samples_per_rev = int(round(sec_per_rev * fs))
+        samples_per_rev = int(round(sec_per_rev * plot_rate))
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
@@ -1252,6 +1313,7 @@ async def _analyze_device(text_data, rpm=None):
         'metrics': {
             'f_mean': None,
             'carrier_freq': 500.0,
+            'despike_ms': float(despike_ms),
             'rpm': rpm_info,
             'f_rot': float(f_rot) if f_rot else None,
             'duration': duration,
