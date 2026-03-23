@@ -997,7 +997,7 @@ def _parse_device_data(text_data, fmt):
 
 def analyzeFull(data, sampleRate=None, inputType='audio',
                 rpm=None, motor_slots=None, motor_poles=None,
-                drive_ratio=1.0, prefilter_high=1.9):
+                drive_ratio=1.0, fm_bw=None):
     """
     Single entry point for all analysis. Sync wrapper — detects whether
     an event loop is running (Pyodide) and returns a coroutine for await,
@@ -1016,9 +1016,9 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
                      and torque ripple harmonic labels. Requires rpm.
         drive_ratio: motor-to-platter speed ratio for non-direct-drive
                      (default 1.0 = direct drive).
-        prefilter_high: upper prefilter bound as a multiple of carrier
-                        frequency. Default 1.9 matches Virtins spec.
-                        Lower bound is fixed at 0.1× carrier per AES6.
+        fm_bw: FM measurement bandwidth in Hz, or 'aes_min' for 200 Hz,
+               or None (default) for max (0.4 × carrier).  Clamped to
+               0.4 × carrier internally.
 
     Returns structured result dict per SPA integration plan.
     """
@@ -1027,7 +1027,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
     coro = _analyzeFull_async(data, sampleRate=sampleRate, inputType=inputType,
                                rpm=rpm, motor_slots=motor_slots,
                                motor_poles=motor_poles, drive_ratio=drive_ratio,
-                               prefilter_high=prefilter_high)
+                               fm_bw=fm_bw)
 
     # In Pyodide (or any running event loop), return the coroutine for await.
     # In CLI (no event loop), run synchronously.
@@ -1040,7 +1040,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
 
 async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
                               rpm=None, motor_slots=None, motor_poles=None,
-                              drive_ratio=1.0, prefilter_high=1.9):
+                              drive_ratio=1.0, fm_bw=None):
     """Async implementation of analyzeFull."""
     _clear_state()
 
@@ -1055,11 +1055,11 @@ async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
     else:
         if sampleRate is None:
             raise ValueError("sampleRate is required for audio input")
-        return await _analyze_audio(data, sampleRate, prefilter_high=prefilter_high)
+        return await _analyze_audio(data, sampleRate, fm_bw=fm_bw)
 
 
-async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
-    """Full audio pipeline — Hilbert demod with configurable prefilter."""
+async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
+    """Full audio pipeline — Hilbert demod with configurable measurement BW."""
     fs = sample_rate
     sig = np.asarray(pcm_data, dtype=np.float64)
     nyq = fs / 2.0
@@ -1087,17 +1087,15 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
     await _status("Detecting carrier frequency...")
     f_est = _estimate_carrier_freq(sig, fs)
 
-    # 2. Bandpass prefilter — low fixed at 0.1×carrier, high configurable (default 1.9×)
+    # 2. Bandpass prefilter — fixed at 0.1×–1.9× carrier
     await _status("Applying prefilter...")
     if f_est > 0:
         bp_low = max(f_est * 0.1, 1.0)
-        bp_high = min(f_est * prefilter_high, nyq * 0.95)
-        bw_hz = bp_high - bp_low
+        bp_high = min(f_est * 1.9, nyq * 0.95)
         b, a = butter(PREFILTER_ORDER, [bp_low / nyq, bp_high / nyq], btype='band')
         sig_filtered = filtfilt(b, a, sig)
     else:
         sig_filtered = sig
-        bw_hz = None
 
     # 3. Hilbert demod → instantaneous frequency
     await _status("Hilbert demodulation...")
@@ -1106,8 +1104,18 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
     inst_freq = np.diff(phase) * fs / (2.0 * np.pi)
     del analytic, phase
 
-    # 4. Lowpass at 0.4×carrier (anti-alias for decimation + measurement BW)
-    lp_cut = min(0.4 * f_est, nyq * 0.95)
+    # 4. Lowpass — FM measurement bandwidth
+    #    Resolve fm_bw: None → max (0.4×carrier), 'aes_min' → 200 Hz, numeric → Hz
+    #    Always clamped to 0.4×carrier (Nyquist of FM system)
+    carrier_max = 0.4 * f_est
+    if fm_bw is None:
+        lp_cut = carrier_max
+    elif fm_bw == 'aes_min':
+        lp_cut = min(200.0, carrier_max)
+    else:
+        lp_cut = min(float(fm_bw), carrier_max)
+    lp_cut = min(lp_cut, nyq * 0.95)
+
     if lp_cut > 0:
         sos_lp = butter(4, lp_cut / nyq, btype='low', output='sos')
         inst_freq = sosfiltfilt(sos_lp, inst_freq)
@@ -1209,11 +1217,19 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9):
 
     await _status("Complete")
 
+    # Build fm_bw options: 200 Hz steps from AES min to below max
+    fm_bw_max = int(carrier_max)
+    fm_bw_options = list(range(200, fm_bw_max, 200)) if fm_bw_max > 200 else []
+
     return {
         'metrics': {
             'f_mean': f_mean,
             'carrier_freq': float(f_est),
-            'prefilter_high': float(prefilter_high),
+            'fm_bw': {
+                'value': float(lp_cut),
+                'max': float(carrier_max),
+                'options': fm_bw_options,
+            },
             'rpm': rpm_info,
             'duration': float(duration),
             'input_type': 'audio',
@@ -1378,6 +1394,9 @@ def _plot_polar(params):
 
     params:
         revolutions: int (default 2)
+        polar_lp: LP filter cutoff in Hz (default 60). Clamped to
+                  0.4 × carrier max.  Smooths the polar trace for
+                  visual clarity without affecting metrics.
     """
     f_rot = _state.get('_f_rot')
     if f_rot is None or f_rot <= 0:
@@ -1387,6 +1406,13 @@ def _plot_polar(params):
     deviation_pct = _state['_deviation_pct']
     output_rate = _state['_output_rate']
     f_mean = _state['_f_mean']
+
+    # Polar LP — 3rd order Butterworth, filtfilt = 6-pole zero-phase
+    polar_lp = float(params.get('polar_lp', 60))
+    carrier_max = 0.4 * (f_mean if f_mean else 1000.0)
+    polar_lp = max(1.0, min(polar_lp, carrier_max, output_rate * 0.45))
+    b_lp, a_lp = butter(3, polar_lp / (output_rate / 2.0), btype='low')
+    deviation_pct = filtfilt(b_lp, a_lp, deviation_pct)
 
     sec_per_rev = 1.0 / f_rot
     samples_per_rev = int(round(sec_per_rev * output_rate))
