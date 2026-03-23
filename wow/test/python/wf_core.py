@@ -15,13 +15,14 @@ handle presentation.
 
 Signal processing pipeline (audio):
   1. Carrier frequency estimation via FFT peak detection
-  2. Configurable bandpass prefilter (default 0.1×–1.9× carrier, Virtins spec)
-  3. Hilbert analytic signal demodulation → instantaneous frequency
-  4. Lowpass at 0.4×carrier (measurement BW + anti-alias)
-  5. Edge trim (Hilbert transient + prefilter settling)
-  6. Decimation to ~2×LP cutoff rate
+  2. Auto-tuned bandpass prefilter centered on carrier
+  3. Vectorized zero-crossing detection with hysteresis
+  4. Per-cycle frequency from crossing periods
+  5. Adaptive edge trimming + outlier rejection + median despike
+  6. CubicSpline interpolation to uniform time grid
   7. Metrics: AES6/DIN weighted + unweighted + drift
   8. Spectrum + peak detection + motor harmonic ID
+  9. AM/FM coupling markers (audio only)
 
 Device pipeline enters at step 7 (deviation already available).
 """
@@ -347,136 +348,87 @@ def _metric(value, confidence=0):
     return {'value': float(value), 'confidence': int(confidence)}
 
 
-_DESPIKE_PLOT_RATE = 3000  # SRC target for plot despike — consistent kernel behaviour
-
-
-def _despike_plot(dev_pct, src_rate, despike_ms, t_array):
-    """SRC plot data to a common rate, apply median despike, return despiked data + new t.
-
-    Parameters
-    ----------
-    dev_pct : ndarray — deviation in percent at src_rate
-    src_rate : float — native sample rate of dev_pct
-    despike_ms : float — despike window in ms (0 = off)
-    t_array : ndarray — time axis at native rate
-
-    Returns
-    -------
-    (dev_out, t_out, plot_rate) — despiked deviation, time axis, output sample rate
-    """
-    from math import gcd
-
-    target = _DESPIKE_PLOT_RATE
-
-    if despike_ms <= 0 or src_rate <= 0:
-        return dev_pct, t_array, src_rate
-
-    # SRC to target rate
-    up = target
-    down = int(round(src_rate))
-    if up != down:
-        g = gcd(up, down)
-        dev_resampled = resample_poly(dev_pct, up // g, down // g)
-        t_resampled = np.linspace(t_array[0], t_array[-1], len(dev_resampled))
-    else:
-        dev_resampled = dev_pct
-        t_resampled = t_array
-
-    # Medfilt despike
-    k = int(despike_ms / 1000.0 * target)
-    if k % 2 == 0:
-        k += 1
-    k = max(3, k)
-    dev_out = medfilt(dev_resampled, kernel_size=k)
-
-    return dev_out, t_resampled, float(target)
-
-
-def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
-                        unweighted_bw='virtins'):
+def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0):
     """
     Compute all wow & flutter metrics from fractional deviation signal.
 
-    Unweighted metrics computed at original sample rate (pre-SRC) to
-    preserve full bandwidth up to 0.4×carrier.
-    Weighted metrics computed at 1 kHz via SRC (AES6 weighting filter
-    uses lfilter + lfilter_zi, causal, zero transient).
-
-    Parameters:
-        deviation_frac: fractional deviation signal (f - f_mean) / f_mean
-        fs: sample rate of deviation_frac (Hz)
-        carrier_freq: detected carrier frequency (Hz)
-        skip_seconds: seconds to skip at start for filter settling
-        unweighted_bw: bandwidth mode for unweighted metrics
-            'virtins' (default): LP at 0.4×carrier, no HP — matches
-                Virtins Multi-Instrument and satisfies AES6-2008 §6.1.1
-                NOTE ("at least 0.2 Hz to 200 Hz").
-            'aes6_min': BP 0.2–200 Hz — minimum AES6 NOTE range.
+    All metrics computed at 1 kHz (single path via mirror-padded SRC).
+    Weighting filter uses lfilter + lfilter_zi (causal, zero transient).
 
     Returns:
         standard: dict of standardized metrics (AES6/DIN/IEC)
         non_standard: dict of non-standardized metrics
-        dev_unwtd: LP-filtered fractional deviation used for unweighted metrics
     """
-    nyq = fs / 2.0
-    n_total = len(deviation_frac)
-    capture_dur = n_total / fs
-    skip = int(skip_seconds * fs)
+    # --- SRC everything to 1 kHz (single signal path) ---
+    dev, fs_w = _src_to_1khz(deviation_frac, fs)
 
-    # =================================================================
-    # Unweighted (at original sample rate — preserves full bandwidth)
-    # =================================================================
-    if unweighted_bw == 'aes6_min':
-        # AES6 §6.1.1 NOTE minimum: 0.2–200 Hz bandpass
-        bp_lo = 0.2
-        bp_hi = min(200.0, nyq * 0.95)
-        if bp_hi > bp_lo:
-            sos_u = butter(4, [bp_lo / nyq, bp_hi / nyq],
-                           btype='band', output='sos')
-            dev_unwtd = sosfiltfilt(sos_u, deviation_frac)
-        else:
-            dev_unwtd = deviation_frac.copy()
-        unwtd_flutter_hi = bp_hi
+    skip = int(skip_seconds * fs_w)
+    nyquist = fs_w / 2.0
+    n_total = len(dev)
+    capture_dur = n_total / fs_w
+
+    # --- Unweighted (AES6 + Virtins spec) ---
+    # Lower bound 0.2 Hz (AES6 6.1.1 NOTE), upper = min(0.4*carrier, 200 Hz)
+    bp_lo = 0.2
+    bp_hi = min(0.4 * carrier_freq, 200.0, nyquist * 0.95)
+    if bp_hi > bp_lo:
+        sos_bp = butter(4, [bp_lo / nyquist, bp_hi / nyquist],
+                         btype='band', output='sos')
+        dev_unwtd = sosfiltfilt(sos_bp, dev)
     else:
-        # Virtins spec: LP at 0.4×carrier, no HP (lower bound = 1/dur)
-        lp_hi = min(0.4 * carrier_freq, nyq * 0.95)
-        if lp_hi > 0:
-            sos_u = butter(4, lp_hi / nyq, btype='low', output='sos')
-            dev_unwtd = sosfiltfilt(sos_u, deviation_frac)
-        else:
-            dev_unwtd = deviation_frac.copy()
-        unwtd_flutter_hi = lp_hi
+        dev_unwtd = dev.copy()
 
     dev_u = dev_unwtd[skip:]
     unwtd_peak = float(np.percentile(np.abs(dev_u), 95) * 100.0)
     unwtd_rms = float(np.sqrt(np.mean(dev_u**2)) * 100.0)
 
-    # --- Unweighted wow/flutter band separation (Virtins spec) ---
-    # Wow: 0.5–6 Hz, Flutter: 6 Hz – unwtd_flutter_hi
-    wow_cut = min(6.0, nyq * 0.95)
+    # --- Weighted (standardized: AES6-2008 / DIN / IEC) ---
+    b_w, a_w = _make_aes6_weighting_filter(fs_w)
+    zi = lfilter_zi(b_w, a_w) * dev[0]
+    dev_weighted, _ = lfilter(b_w, a_w, dev, zi=zi)
+    dev_w = dev_weighted[skip:]
+    wtd_peak = float(np.percentile(np.abs(dev_w), 95) * 100.0)
+    wtd_rms = float(np.sqrt(np.mean(dev_w**2)) * 100.0)
+
+    # --- Band separation: wow (<6 Hz) and flutter (>6 Hz) ---
+    wow_cut = min(6.0, nyquist * 0.95)
+
+    # Weighted wow/flutter (standardized)
+    wtd_wow_rms = 0.0
+    wtd_flutter_rms = 0.0
+    if wow_cut > 0.5:
+        sos_wow = butter(6, wow_cut / nyquist, btype='low', output='sos')
+        wow_sig = sosfiltfilt(sos_wow, dev_weighted)
+        wtd_wow_rms = float(np.sqrt(np.mean(wow_sig[skip:]**2)) * 100.0)
+
+        sos_flutter = butter(6, wow_cut / nyquist, btype='high', output='sos')
+        flutter_sig = sosfiltfilt(sos_flutter, dev_weighted)
+        wtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig[skip:]**2)) * 100.0)
+
+    # Unweighted wow/flutter (Virtins spec)
+    # Wow: 0.5–6 Hz (both weighted and unweighted per Virtins)
+    # Flutter: 6 Hz – min(0.4*carrier, 200) Hz (upper inherited from dev_unwtd)
     unwtd_wow_rms = 0.0
     unwtd_flutter_rms = 0.0
-    if wow_cut > 0.5:
+    if wow_cut > 0.5 and bp_hi > bp_lo:
         wow_lo = 0.5
-        if wow_lo < nyq * 0.95 and wow_cut > wow_lo:
-            sos_wow_u = butter(6, [wow_lo / nyq, wow_cut / nyq],
+        if wow_lo < nyquist * 0.95 and wow_cut < nyquist * 0.95 and wow_cut > wow_lo:
+            sos_wow_u = butter(6, [wow_lo / nyquist, wow_cut / nyquist],
                                btype='band', output='sos')
             wow_sig_u = sosfiltfilt(sos_wow_u, dev_unwtd)
             unwtd_wow_rms = float(np.sqrt(np.mean(wow_sig_u[skip:]**2)) * 100.0)
 
-        if unwtd_flutter_hi > wow_cut:
-            sos_flutter_u = butter(6, [wow_cut / nyq, unwtd_flutter_hi / nyq],
-                                   btype='band', output='sos')
-            flutter_sig_u = sosfiltfilt(sos_flutter_u, dev_unwtd)
-            unwtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig_u[skip:]**2)) * 100.0)
+        sos_flutter_u = butter(6, wow_cut / nyquist, btype='high', output='sos')
+        flutter_sig_u = sosfiltfilt(sos_flutter_u, dev_unwtd)
+        unwtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig_u[skip:]**2)) * 100.0)
 
-    # --- Drift (non-standardized, at original sample rate) ---
+    # --- Drift (non-standardized) ---
     drift_rms = 0.0
     drift_lo = max(0.05, 1.0 / capture_dur)
     drift_hi = 0.5
-    if drift_hi > drift_lo and drift_hi < nyq * 0.95:
+    if drift_hi > drift_lo and drift_hi < nyquist * 0.95:
         drift_taper_s = 2.0
-        taper_n = min(int(drift_taper_s * fs), n_total // 4)
+        taper_n = min(int(drift_taper_s * fs_w), n_total // 4)
         taper_window = np.ones(n_total)
         ramp = 0.5 * (1 - np.cos(np.pi * np.arange(taper_n) / taper_n))
         taper_window[:taper_n] = ramp
@@ -484,41 +436,14 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
 
         drift_order = 10
         sos_drift = butter(drift_order,
-                           [drift_lo / nyq, drift_hi / nyq],
+                           [drift_lo / nyquist, drift_hi / nyquist],
                            btype='band', output='sos')
-        drift_sig = sosfiltfilt(sos_drift, deviation_frac * taper_window)
+        drift_sig = sosfiltfilt(sos_drift, dev * taper_window)
 
-        drift_skip = max(skip, taper_n, int(2.0 * fs))
+        drift_skip = max(skip, taper_n, int(2.0 * fs_w))
         if n_total > 2 * drift_skip:
             drift_sig = drift_sig[drift_skip:-drift_skip]
             drift_rms = float(np.sqrt(np.mean(drift_sig**2)) * 100.0)
-
-    # =================================================================
-    # Weighted (SRC to 1 kHz for AES6 weighting filter)
-    # =================================================================
-    dev_w, fs_w = _src_to_1khz(deviation_frac, fs)
-    nyq_w = fs_w / 2.0
-    skip_w = int(skip_seconds * fs_w)
-
-    b_w, a_w = _make_aes6_weighting_filter(fs_w)
-    zi = lfilter_zi(b_w, a_w) * dev_w[0]
-    dev_weighted, _ = lfilter(b_w, a_w, dev_w, zi=zi)
-    dw = dev_weighted[skip_w:]
-    wtd_peak = float(np.percentile(np.abs(dw), 95) * 100.0)
-    wtd_rms = float(np.sqrt(np.mean(dw**2)) * 100.0)
-
-    # --- Weighted wow/flutter (standardized) ---
-    wow_cut_w = min(6.0, nyq_w * 0.95)
-    wtd_wow_rms = 0.0
-    wtd_flutter_rms = 0.0
-    if wow_cut_w > 0.5:
-        sos_wow = butter(6, wow_cut_w / nyq_w, btype='low', output='sos')
-        wow_sig = sosfiltfilt(sos_wow, dev_weighted)
-        wtd_wow_rms = float(np.sqrt(np.mean(wow_sig[skip_w:]**2)) * 100.0)
-
-        sos_flutter = butter(6, wow_cut_w / nyq_w, btype='high', output='sos')
-        flutter_sig = sosfiltfilt(sos_flutter, dev_weighted)
-        wtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig[skip_w:]**2)) * 100.0)
 
     # --- Confidence ---
     # Placeholder: all 0 (full confidence).
@@ -540,7 +465,7 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
         'drift_rms':              _metric(drift_rms, conf),
     }
 
-    return standard, non_standard, dev_unwtd
+    return standard, non_standard
 
 
 # ========================= SPECTRUM =========================
@@ -1002,7 +927,7 @@ def _parse_device_data(text_data, fmt):
 
 def analyzeFull(data, sampleRate=None, inputType='audio',
                 rpm=None, motor_slots=None, motor_poles=None,
-                drive_ratio=1.0, prefilter_high=1.9, despike_ms=5):
+                drive_ratio=1.0):
     """
     Single entry point for all analysis. Sync wrapper — detects whether
     an event loop is running (Pyodide) and returns a coroutine for await,
@@ -1021,9 +946,6 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
                      and torque ripple harmonic labels. Requires rpm.
         drive_ratio: motor-to-platter speed ratio for non-direct-drive
                      (default 1.0 = direct drive).
-        prefilter_high: upper prefilter bound as a multiple of carrier
-                        frequency. Default 1.9 matches Virtins spec.
-                        Lower bound is fixed at 0.1× carrier per AES6.
 
     Returns structured result dict per SPA integration plan.
     """
@@ -1031,8 +953,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
 
     coro = _analyzeFull_async(data, sampleRate=sampleRate, inputType=inputType,
                                rpm=rpm, motor_slots=motor_slots,
-                               motor_poles=motor_poles, drive_ratio=drive_ratio,
-                               prefilter_high=prefilter_high, despike_ms=despike_ms)
+                               motor_poles=motor_poles, drive_ratio=drive_ratio)
 
     # In Pyodide (or any running event loop), return the coroutine for await.
     # In CLI (no event loop), run synchronously.
@@ -1045,7 +966,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
 
 async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
                               rpm=None, motor_slots=None, motor_poles=None,
-                              drive_ratio=1.0, prefilter_high=1.9, despike_ms=5):
+                              drive_ratio=1.0):
     """Async implementation of analyzeFull."""
     _clear_state()
 
@@ -1056,19 +977,18 @@ async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
     _state['_drive_ratio'] = drive_ratio
 
     if inputType == 'device':
-        return await _analyze_device(data, rpm=rpm, despike_ms=despike_ms)
+        return await _analyze_device(data, rpm=rpm)
     else:
         if sampleRate is None:
             raise ValueError("sampleRate is required for audio input")
-        return await _analyze_audio(data, sampleRate, prefilter_high=prefilter_high, despike_ms=despike_ms)
+        return await _analyze_audio(data, sampleRate)
 
 
-async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5):
-    """Full audio pipeline — Hilbert demod with configurable prefilter."""
+async def _analyze_audio(pcm_data, sample_rate):
+    """Full audio pipeline."""
     fs = sample_rate
     sig = np.asarray(pcm_data, dtype=np.float64)
     duration = len(sig) / fs
-    nyq = fs / 2.0
 
     await _status(f"Loaded: {duration:.1f}s at {fs} Hz")
 
@@ -1076,74 +996,68 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5
     await _status("Detecting carrier frequency...")
     f_est = _estimate_carrier_freq(sig, fs)
 
-    # 2. Bandpass prefilter — low fixed at 0.1×carrier, high configurable (default 1.9×)
+
+    # 2. Bandpass prefilter
     await _status("Applying prefilter...")
-    if f_est > 0:
-        bp_low = max(f_est * 0.1, 1.0)
-        bp_high = min(f_est * prefilter_high, nyq * 0.95)
-        bw_hz = bp_high - bp_low
-        b, a = butter(PREFILTER_ORDER, [bp_low / nyq, bp_high / nyq], btype='band')
-        sig_filtered = filtfilt(b, a, sig)
+    if PREFILTER_BW_FACTOR is not None and f_est > 0:
+        bw_hz = f_est * PREFILTER_BW_FACTOR
+        MAX_BW_HZ = 150.0
+        if f_est > 500 and bw_hz > MAX_BW_HZ:
+            bw_hz = MAX_BW_HZ
+        bp_low = max(f_est - bw_hz, 1.0)
+        bp_high = min(f_est + bw_hz, fs / 2.0 * 0.95)
+        sig_filtered = _bandpass_prefilter(sig, fs, bp_low, bp_high,
+                                            order=PREFILTER_ORDER)
     else:
         sig_filtered = sig
         bw_hz = None
 
-    # 3. Hilbert demod → instantaneous frequency
-    await _status("Hilbert demodulation...")
-    analytic = hilbert(sig_filtered)
-    phase = np.unwrap(np.angle(analytic))
-    inst_freq = np.diff(phase) * fs / (2.0 * np.pi)
-    del analytic, phase
 
-    # 4. Lowpass at 0.4×carrier (anti-alias for decimation + measurement BW)
-    lp_cut = min(0.4 * f_est, nyq * 0.95)
-    if lp_cut > 0:
-        sos_lp = butter(4, lp_cut / nyq, btype='low', output='sos')
-        inst_freq = sosfiltfilt(sos_lp, inst_freq)
+    # 3. Zero crossings
+    await _status("Finding zero crossings...")
+    crossing_times = _find_zero_crossings(sig_filtered, fs)
 
-    # 5. Edge trim — Hilbert transient settling time
-    #    The FFT-based Hilbert has edge artifacts that decay over a few cycles
-    #    of the lowest frequency present.  After prefilter, f_low = 0.1×carrier.
-    #    We trim 3 cycles × 2× safety margin = 6 / f_low from each edge.
-    await _status("Trimming edges...")
-    n_if = len(inst_freq)
 
-    f_low = max(f_est * 0.1, 1.0)                      # lowest freq after prefilter
-    edge_time = 6.0 / f_low                             # 3 cycles × 2× margin
-    edge_samples = max(int(edge_time * fs), int(0.01 * fs))  # floor 10 ms
-    edge_samples = min(edge_samples, n_if // 4)         # never trim more than 25% per side
+    if len(crossing_times) < 3:
+        raise ValueError(
+            f"Only {len(crossing_times)} zero crossings found. "
+            "No valid carrier signal detected in the audio."
+        )
 
-    trim_start = edge_samples
-    trim_end = edge_samples
-    inst_freq = inst_freq[trim_start:-trim_end] if trim_end > 0 else inst_freq
+    # 4. Per-cycle frequency
+    t_freq, freq = _crossings_to_frequency(crossing_times)
 
-    edge_time_offset = trim_start / fs  # seconds into original file
+    # 5. Edge trim + outlier rejection + despike
+    await _status("Cleaning frequency data...")
+    if PREFILTER_BW_FACTOR is not None:
+        t_freq, freq = _edge_trim(t_freq, freq, prefilter_bw_hz=bw_hz)
+    t_freq, freq, n_rejected = _outlier_reject(t_freq, freq)
+    freq = _median_despike(t_freq, freq)
 
-    f_mean = float(np.mean(inst_freq))
-    deviation_frac = (inst_freq - f_mean) / f_mean
-    del inst_freq
 
-    # 7. Decimate — LP already serves as AA filter
-    min_rate = max(2.0 * lp_cut, 1000.0)
-    dec_factor = max(1, int(fs / min_rate))
-    output_rate = float(fs / dec_factor)
-    deviation_frac = deviation_frac[::dec_factor]
+    f_mean = float(np.mean(freq))
 
-    t_uniform = np.arange(len(deviation_frac)) / output_rate + edge_time_offset
+    # 6. Smooth + interpolate to uniform grid
+    await _status("Interpolating to uniform grid...")
+    freq_smooth = _smooth_frequency(freq, SMOOTH_CYCLES)
+    t_uniform, f_uniform, output_rate = _interpolate_to_uniform(
+        t_freq, freq_smooth)
 
-    # 7. Metrics — returns LP-filtered deviation used for unweighted measurement
+
+    # Deviation
+    deviation_frac = (f_uniform - f_mean) / f_mean
+    deviation_pct = deviation_frac * 100.0
+
+    # 7. Metrics
     await _status("Computing metrics...")
-    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, output_rate, f_est)
+    standard, non_standard = _compute_wf_metrics(deviation_frac, output_rate, f_est)
 
-    # Plot data: SRC to common rate + medfilt despike
-    deviation_pct, t_uniform, plot_rate = _despike_plot(
-        dev_unwtd * 100.0, output_rate, despike_ms, t_uniform)
 
     # 8. Spectrum + peaks
     await _status("Computing spectrum...")
-    spec_max_freq = 0.4 * f_est if f_est > 0 else 50.0
-    spectrum = _compute_spectrum(deviation_pct, plot_rate,
-                                 max_freq=spec_max_freq)
+    spectrum = _compute_spectrum(deviation_pct, output_rate,
+                                 max_freq=bw_hz if bw_hz else 50.0)
+
 
     # RPM: use user-provided, or auto-detect from spectrum
     user_rpm = _state.get('_rpm')
@@ -1169,16 +1083,41 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5
                                motor_poles=_state.get('_motor_poles'),
                                drive_ratio=_state.get('_drive_ratio', 1.0))
 
-    # 9. AM/FM coupling — disabled pending rework
-    _state['_am_envelope'] = None
+    # 9. AM/FM coupling markers
+    await _status("Computing AM/FM coupling...")
+    # AM envelope from prefiltered signal via Hilbert — normalized to percent
+    # deviation from mean, matching the purpose-built coupling analysis.
+    # Decimate before Hilbert: AM content is <50 Hz, so ~500 Hz target rate
+    # is plenty. Reduces FFT from ~8.8M to ~46k samples in Pyodide.
+    dec_factor = max(1, int(fs // 500))
+    if dec_factor > 1:
+        sig_dec = decimate(sig_filtered, dec_factor, ftype='fir')
+        fs_dec = fs / dec_factor
+    else:
+        sig_dec = sig_filtered
+        fs_dec = fs
+    am_envelope = np.abs(hilbert(sig_dec))
+    # Trim 1s edges (Hilbert artifact), then normalize to percent
+    trim_am = int(1.0 * fs_dec)
+    am_trimmed = am_envelope[trim_am:-trim_am] if len(am_envelope) > 2 * trim_am else am_envelope
+    am_mean = np.mean(am_trimmed)
+    am_pct = (am_trimmed - am_mean) / am_mean * 100.0
+    # Resample AM (percent) to match deviation grid
+    am_t_raw = np.arange(len(am_pct)) / fs_dec + (trim_am / fs_dec)
+    am_resampled = np.interp(t_uniform, am_t_raw, am_pct)
+
+    coupling_threshold = _compute_coupling_markers(
+        spectrum['peaks'], am_resampled, deviation_pct, output_rate)
+    _state['_am_envelope'] = am_resampled
     _state['_fm_deviation'] = deviation_pct
-    spectrum['coupling_threshold'] = None
-    _state['_coupling_threshold'] = None
+    spectrum['coupling_threshold'] = coupling_threshold
+    _state['_coupling_threshold'] = coupling_threshold
+
 
     # Stash state for getPlotData
     _state['_deviation_pct'] = deviation_pct
     _state['_t_uniform'] = t_uniform
-    _state['_output_rate'] = plot_rate
+    _state['_output_rate'] = output_rate
     _state['_f_mean'] = f_mean
     _state['_f_rot'] = f_rot
     _state['_input_type'] = 'audio'
@@ -1193,7 +1132,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5
     # Polar requires rpm (need rotation period to define one revolution)
     if f_rot is not None and f_rot > 0:
         sec_per_rev = 1.0 / f_rot
-        samples_per_rev = int(round(sec_per_rev * plot_rate))
+        samples_per_rev = int(round(sec_per_rev * output_rate))
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
@@ -1203,8 +1142,6 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5
         'metrics': {
             'f_mean': f_mean,
             'carrier_freq': float(f_est),
-            'prefilter_high': float(prefilter_high),
-            'despike_ms': float(despike_ms),
             'rpm': rpm_info,
             'duration': float(duration),
             'input_type': 'audio',
@@ -1224,7 +1161,7 @@ async def _analyze_audio(pcm_data, sample_rate, prefilter_high=1.9, despike_ms=5
     }
 
 
-async def _analyze_device(text_data, rpm=None, despike_ms=5):
+async def _analyze_device(text_data, rpm=None):
     """Device input pipeline — enters at deviation stage."""
     await _status("Detecting device format...")
     fmt = _detect_device_format(text_data)
@@ -1247,15 +1184,11 @@ async def _analyze_device(text_data, rpm=None, despike_ms=5):
     # Metrics
     await _status("Computing metrics...")
     # Device path has no carrier — use 500 Hz for weighting filter
-    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
-
-    # Plot data: SRC to common rate + medfilt despike
-    deviation_pct, time_s, plot_rate = _despike_plot(
-        dev_unwtd * 100.0, fs, despike_ms, time_s)
+    standard, non_standard = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
 
     # Spectrum
     await _status("Computing spectrum...")
-    spectrum = _compute_spectrum(deviation_pct, plot_rate, max_freq=50.0)
+    spectrum = _compute_spectrum(deviation_pct, fs, max_freq=50.0)
 
     # RPM: use override if provided, otherwise detect from spectrum
     if rpm is None:
@@ -1288,7 +1221,7 @@ async def _analyze_device(text_data, rpm=None, despike_ms=5):
     # Stash state for getPlotData
     _state['_deviation_pct'] = deviation_pct
     _state['_t_uniform'] = time_s
-    _state['_output_rate'] = plot_rate
+    _state['_output_rate'] = fs
     _state['_f_mean'] = f_mean
     _state['_f_rot'] = f_rot
     _state['_input_type'] = 'device'
@@ -1303,7 +1236,7 @@ async def _analyze_device(text_data, rpm=None, despike_ms=5):
     # Polar requires rpm (always available for device since we have RPM)
     if f_rot is not None and f_rot > 0:
         sec_per_rev = 1.0 / f_rot
-        samples_per_rev = int(round(sec_per_rev * plot_rate))
+        samples_per_rev = int(round(sec_per_rev * fs))
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
@@ -1313,7 +1246,6 @@ async def _analyze_device(text_data, rpm=None, despike_ms=5):
         'metrics': {
             'f_mean': None,
             'carrier_freq': 500.0,
-            'despike_ms': float(despike_ms),
             'rpm': rpm_info,
             'f_rot': float(f_rot) if f_rot else None,
             'duration': duration,
