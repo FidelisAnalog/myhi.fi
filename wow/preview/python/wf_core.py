@@ -997,14 +997,16 @@ def _parse_device_data(text_data, fmt):
 
 def analyzeFull(data, sampleRate=None, inputType='audio',
                 rpm=None, motor_slots=None, motor_poles=None,
-                drive_ratio=1.0, fm_bw=None):
+                drive_ratio=1.0, fm_bw=None, channel=0):
     """
     Single entry point for all analysis. Sync wrapper — detects whether
     an event loop is running (Pyodide) and returns a coroutine for await,
     otherwise runs synchronously (CLI).
 
     Parameters:
-        data: PCM float64 array (audio) or text string (device)
+        data: PCM float64 array (audio) or text string (device).
+              May be mono or multi-channel. For multi-channel, the
+              channel parameter selects which channel to analyze.
         sampleRate: required for audio, ignored for device
         inputType: 'audio' or 'device'
         rpm: platter/transport RPM (optional). Enables polar plot and
@@ -1019,6 +1021,8 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
         fm_bw: FM measurement bandwidth in Hz, or 'aes_min' for 200 Hz,
                or None (default) for max (0.4 × carrier).  Clamped to
                0.4 × carrier internally.
+        channel: channel index for multi-channel audio (default 0).
+                 Ignored for mono audio and device input.
 
     Returns structured result dict per SPA integration plan.
     """
@@ -1027,7 +1031,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
     coro = _analyzeFull_async(data, sampleRate=sampleRate, inputType=inputType,
                                rpm=rpm, motor_slots=motor_slots,
                                motor_poles=motor_poles, drive_ratio=drive_ratio,
-                               fm_bw=fm_bw)
+                               fm_bw=fm_bw, channel=channel)
 
     # In Pyodide (or any running event loop), return the coroutine for await.
     # In CLI (no event loop), run synchronously.
@@ -1040,7 +1044,7 @@ def analyzeFull(data, sampleRate=None, inputType='audio',
 
 async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
                               rpm=None, motor_slots=None, motor_poles=None,
-                              drive_ratio=1.0, fm_bw=None):
+                              drive_ratio=1.0, fm_bw=None, channel=0):
     """Async implementation of analyzeFull."""
     _clear_state()
 
@@ -1055,7 +1059,16 @@ async def _analyzeFull_async(data, sampleRate=None, inputType='audio',
     else:
         if sampleRate is None:
             raise ValueError("sampleRate is required for audio input")
-        return await _analyze_audio(data, sampleRate, fm_bw=fm_bw)
+        # Extract channel from multi-channel audio
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim > 1:
+            if channel >= arr.shape[1]:
+                raise ValueError(
+                    f"Requested channel {channel} but audio has "
+                    f"only {arr.shape[1]} channels"
+                )
+            arr = arr[:, channel]
+        return await _analyze_audio(arr, sampleRate, fm_bw=fm_bw)
 
 
 async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
@@ -1063,6 +1076,9 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     fs = sample_rate
     sig = np.asarray(pcm_data, dtype=np.float64)
     nyq = fs / 2.0
+    duration = len(sig) / fs
+    await _status(f"Loaded: {duration:.1f}s at {int(fs)} Hz")
+    await _status("Preconditioning signal...")
 
     # 0. Carrier amplitude gate — trim leading/trailing silence
     #    ZC with hysteresis naturally ignored silence; Hilbert demod does not
@@ -1093,7 +1109,6 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
         nyq = fs / 2.0
 
     duration = len(sig) / fs
-    await _status(f"Loaded: {duration:.1f}s at {int(fs)} Hz")
 
     # 1. Carrier frequency
     await _status("Detecting carrier frequency...")
@@ -1227,7 +1242,7 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
-    await _status("Complete")
+    await _status("Processing complete")
 
     # Build fm_bw options: 200 Hz steps from AES min to below max
     fm_bw_max = int(carrier_max)
@@ -1343,7 +1358,7 @@ async def _analyze_device(text_data, rpm=None):
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
-    await _status("Complete")
+    await _status("Processing complete")
 
     return {
         'metrics': {
@@ -1409,6 +1424,7 @@ def _plot_polar(params):
         polar_lp: LP filter cutoff in Hz (default 60). Clamped to
                   Nyquist of the output sample rate.  Smooths the polar
                   trace for visual clarity without affecting metrics.
+                  Pass 0 to disable filtering.
     """
     f_rot = _state.get('_f_rot')
     if f_rot is None or f_rot <= 0:
@@ -1420,10 +1436,12 @@ def _plot_polar(params):
     f_mean = _state['_f_mean']
 
     # Polar LP — 3rd order Butterworth, filtfilt = 6-pole zero-phase
+    # Pass polar_lp=0 to disable
     polar_lp = float(params.get('polar_lp', 60))
-    polar_lp = max(1.0, min(polar_lp, output_rate * 0.45))
-    b_lp, a_lp = butter(3, polar_lp / (output_rate / 2.0), btype='low')
-    deviation_pct = filtfilt(b_lp, a_lp, deviation_pct)
+    if polar_lp > 0:
+        polar_lp = min(polar_lp, output_rate * 0.45)
+        b_lp, a_lp = butter(3, polar_lp / (output_rate / 2.0), btype='low')
+        deviation_pct = filtfilt(b_lp, a_lp, deviation_pct)
 
     sec_per_rev = 1.0 / f_rot
     samples_per_rev = int(round(sec_per_rev * output_rate))
