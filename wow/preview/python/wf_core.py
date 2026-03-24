@@ -1171,7 +1171,7 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
 
     # 8. Spectrum + peaks
     await _status("Computing spectrum...")
-    spec_max_freq = 0.4 * f_est if f_est > 0 else 50.0
+    spec_max_freq = lp_cut if lp_cut > 0 else 50.0
     spectrum = _compute_spectrum(deviation_pct, output_rate,
                                  max_freq=spec_max_freq)
 
