@@ -537,7 +537,8 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
     Returns:
         standard: dict of standardized metrics (AES6/DIN/IEC)
         non_standard: dict of non-standardized metrics
-        dev_unwtd: fractional deviation (unfiltered, for caller's use)
+        dev_bw: BW-limited fractional deviation (ZC-trimmed, same signal metrics are computed from)
+        trim_samples: total samples trimmed from start (skip + ZC trim) for time offset
     """
     nyq = fs / 2.0
     skip = int(skip_seconds * fs)
@@ -548,9 +549,9 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
     # sees a signal that starts and ends near zero.  Eliminates spectral
     # leakage from non-integer modulation cycles that otherwise spreads
     # energy across band boundaries (e.g. 4 Hz tone leaking into flutter).
+    zc_start = 0
     search_n = min(int(2.0 * fs), len(dev) // 4)
     if search_n > 1:
-        zc_start = 0
         for i in range(search_n):
             if dev[i] <= 0 and dev[i + 1] > 0:
                 zc_start = i + 1
@@ -561,6 +562,8 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
                 zc_end = i
                 break
         dev = dev[zc_start:zc_end]
+
+    trim_samples = skip + zc_start
 
     N = len(dev)
 
@@ -650,7 +653,7 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
         'drift_rms':              _metric(band_results['drift'], conf),
     }
 
-    return standard, non_standard, deviation_frac
+    return standard, non_standard, dev_bw, trim_samples
 
 
 # ========================= SPECTRUM =========================
@@ -1295,11 +1298,11 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     output_rate = float(fs)
 
     await _status("Computing metrics...")
-    standard, non_standard, dev_unwtd = _compute_wf_metrics(
+    standard, non_standard, dev_bw, metrics_trim = _compute_wf_metrics(
         deviation_frac, output_rate, f_est, lp_cut=lp_cut)
 
-    # Plot data: brick-wall BW-limited, despiked, decimated for display
-    dev_bw = _fft_bw_limit(dev_unwtd, output_rate, lp_cut)
+    # Plot data: from metrics function (ZC-trimmed, BW-limited — same signal
+    # the metrics are computed from). Despike and decimate for display.
     deviation_pct = _despike_plot(dev_bw * 100.0)
 
     # Decimate plot data for frontend display (target ~2500 Hz)
@@ -1309,7 +1312,9 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
         deviation_pct = deviation_pct[::plot_dec]
         plot_rate = output_rate / plot_dec
 
-    t_uniform = np.arange(len(deviation_pct)) / plot_rate + edge_time_offset
+    # Time offset: edge trim + metrics trim (skip + ZC trim)
+    plot_time_offset = edge_time_offset + metrics_trim / fs
+    t_uniform = np.arange(len(deviation_pct)) / plot_rate + plot_time_offset
 
     # 7. Spectrum + peaks
     await _status("Computing spectrum...")
@@ -1426,10 +1431,12 @@ async def _analyze_device(text_data, rpm=None):
     # Metrics
     await _status("Computing metrics...")
     # Device path has no carrier — use 500 Hz for weighting filter
-    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
+    standard, non_standard, dev_bw, metrics_trim = _compute_wf_metrics(deviation_frac, fs, carrier_freq=500.0)
 
-    # Plot data: MAD despike at native rate
-    deviation_pct = _despike_plot(dev_unwtd * 100.0)
+    # Plot data: from metrics function (ZC-trimmed, BW-limited)
+    deviation_pct = _despike_plot(dev_bw * 100.0)
+    # Adjust time axis for device path
+    time_s = time_s[metrics_trim:metrics_trim + len(deviation_pct)]
 
     # Spectrum
     await _status("Computing spectrum...")
