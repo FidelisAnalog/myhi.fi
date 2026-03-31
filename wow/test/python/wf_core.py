@@ -78,16 +78,34 @@ async def _status(msg):
 # ========================= SIGNAL PROCESSING =========================
 
 def _estimate_carrier_freq(sig, fs):
-    """Carrier frequency estimate using FFT peak detection on first 2s."""
-    n_samp = min(len(sig), int(2.0 * fs))
-    s = sig[:n_samp].astype(np.float64)
+    """Carrier frequency estimate via zero-crossing count.
+
+    Counts positive-going zero crossings with linear interpolation
+    over the full signal.  Gives the true mean frequency regardless of
+    modulation depth — matches MI's frequency counter approach (Virtins
+    PDF Section 8).  Falls back to FFT peak on very short signals.
+    """
+    s = sig.astype(np.float64)
     s = s - np.mean(s)
-    win = np.hanning(len(s))
-    X = np.abs(np.fft.rfft(s * win))
-    freqs = np.fft.rfftfreq(len(s), d=1.0 / fs)
-    min_idx = max(1, int(20.0 / (fs / len(s))))
-    peak_idx = min_idx + np.argmax(X[min_idx:])
-    return freqs[peak_idx]
+
+    # Positive-going zero crossings
+    crossings = np.where((s[:-1] <= 0) & (s[1:] > 0))[0]
+    if len(crossings) < 2:
+        # Fallback: FFT peak for very short/quiet signals
+        n_samp = min(len(s), int(2.0 * fs))
+        win = np.hanning(n_samp)
+        X = np.abs(np.fft.rfft(s[:n_samp] * win))
+        freqs = np.fft.rfftfreq(n_samp, d=1.0 / fs)
+        min_idx = max(1, int(20.0 / (fs / n_samp)))
+        return float(freqs[min_idx + np.argmax(X[min_idx:])])
+
+    # Interpolate crossing times for sub-sample accuracy
+    s0 = s[crossings]
+    s1 = s[crossings + 1]
+    frac = -s0 / (s1 - s0)
+    times = (crossings.astype(np.float64) + frac) / fs
+
+    return float((len(times) - 1) / (times[-1] - times[0]))
 
 
 def _bandpass_prefilter(sig, fs, low, high, order=2):
@@ -265,35 +283,182 @@ def _median_despike(t_freq, freq, kernel=5):
     return freq
 
 
+# ========================= FFT BAND SPLIT =========================
+
+def _build_band_masks(freqs, bands):
+    """
+    Build power-complementary band masks for FFT-domain band splitting.
+
+    Parameters:
+        freqs: 1D array of FFT bin frequencies (from rfftfreq)
+        bands: ordered dict of {name: (f_low, f_high, trans_lo, trans_hi)}
+            f_low, f_high: band edges in Hz
+            trans_lo: smooth transition width at lower edge (Hz), 0 = brick wall
+            trans_hi: smooth transition width at upper edge (Hz), 0 = brick wall
+
+    Returns:
+        dict of {name: 1D mask array} — masks sum to 1.0 at every bin.
+    """
+    n = len(freqs)
+    masks = {}
+    allocated = np.zeros(n)
+
+    for name, (f_lo, f_hi, t_lo, t_hi) in bands.items():
+        mask = np.zeros(n)
+
+        # Lower edge
+        if t_lo > 0:
+            edge_lo = f_lo - t_lo / 2
+            edge_hi = f_lo + t_lo / 2
+            below = freqs <= edge_lo
+            trans = (freqs > edge_lo) & (freqs < edge_hi)
+            above = freqs >= edge_hi
+            mask[above] = 1.0
+            if np.any(trans):
+                mask[trans] = 0.5 * (1 - np.cos(
+                    np.pi * (freqs[trans] - edge_lo) / t_lo))
+        else:
+            mask[freqs >= f_lo] = 1.0
+
+        # Upper edge
+        if t_hi > 0:
+            edge_lo = f_hi - t_hi / 2
+            edge_hi = f_hi + t_hi / 2
+            trans = (freqs > edge_lo) & (freqs < edge_hi)
+            above = freqs >= edge_hi
+            mask[above] = 0.0
+            if np.any(trans):
+                mask[trans] *= 0.5 * (1 + np.cos(
+                    np.pi * (freqs[trans] - edge_lo) / t_hi))
+        else:
+            mask[freqs > f_hi] = 0.0
+
+        masks[name] = mask
+
+    # Normalize so masks sum to 1.0 at every bin (energy conservation)
+    total = np.zeros(n)
+    for m in masks.values():
+        total += m
+    total = np.maximum(total, 1e-30)  # avoid division by zero at DC
+    for name in masks:
+        masks[name] /= total
+
+    return masks
+
+
+def _fft_band_rms(signal, fs, bands):
+    """
+    Compute band-limited RMS from FFT power spectrum (Parseval's theorem).
+
+    No IFFT, no ringing, no trimming. Energy conservation guaranteed
+    when band masks sum to 1.0 at every frequency bin.
+
+    Parameters:
+        signal: 1D deviation array (fractional)
+        fs: sample rate (Hz)
+        bands: dict of {name: (f_low, f_high, trans_lo, trans_hi)}
+
+    Returns:
+        dict of {name: rms_value (float)}
+    """
+    N = len(signal)
+
+    X = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(N, d=1.0 / fs)
+
+    # One-sided power spectrum (rectangular window — exact Parseval for
+    # any signal, stationary or not)
+    P = np.abs(X) ** 2
+    P[1:-1] *= 2.0  # double non-DC, non-Nyquist bins
+
+    masks = _build_band_masks(freqs, bands)
+
+    results = {}
+    for name, mask in masks.items():
+        band_power = np.sum(P * mask)
+        results[name] = float(np.sqrt(band_power / (N * N)))
+
+    return results
+
+
+def _fft_bw_limit(signal, fs, bw_hz):
+    """
+    Brick-wall bandwidth limiting via FFT.
+
+    Zeroes all frequency bins above bw_hz, then IFFT back to time domain.
+    Zero passband attenuation — MI-matched behavior.
+
+    Parameters:
+        signal: 1D real array
+        fs: sample rate (Hz)
+        bw_hz: upper bandwidth limit (Hz)
+
+    Returns:
+        Bandwidth-limited signal (same length, same sample rate)
+    """
+    X = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(len(signal), d=1.0 / fs)
+    X[freqs > bw_hz] = 0.0
+    return np.fft.irfft(X, n=len(signal))
+
+
 # ========================= AES6 WEIGHTING FILTER =========================
+
+# Analog prototype poles and zeros (Hz) — optimized via Wurcer's methodology
+# against AES6-2008 Table 1. See References/AES6 Weighting Filter/README.md.
+_AES6_POLES_HZ = [0.626524, 0.626524, 0.626524, 11.316542]
+_AES6_ZERO_HZ = 227.918719
+_AES6_WTD_BW = 400.0  # Hz — weighted measurement upper BW limit (MI-matched)
+
+
+def _aes6_weighting_magnitude(freqs_hz):
+    """
+    AES6-2008 weighting filter magnitude response from analog prototype.
+
+    Evaluated directly on the s-plane — no bilinear transform, no sample
+    rate dependency, exact at every frequency.  Includes brick-wall cutoff
+    at 400 Hz matching MI's observed weighted bandwidth.
+
+    Parameters:
+        freqs_hz: array of frequencies in Hz
+
+    Returns:
+        magnitude array (linear, normalized to 1.0 at 4 Hz)
+    """
+    f = np.asarray(freqs_hz, dtype=np.float64)
+    s = 1j * 2 * np.pi * f
+
+    # H(s) = s^3 * (s + 2π·z) / ∏(s + 2π·p_i)
+    num = s**3 * (s + 2 * np.pi * _AES6_ZERO_HZ)
+    den = np.ones_like(s, dtype=complex)
+    for p in _AES6_POLES_HZ:
+        den *= (s + 2 * np.pi * p)
+    mag = np.abs(num / den)
+
+    # Normalize to unity at 4 Hz
+    s4 = 1j * 2 * np.pi * 4.0
+    n4 = s4**3 * (s4 + 2 * np.pi * _AES6_ZERO_HZ)
+    d4 = np.prod([s4 + 2 * np.pi * p for p in _AES6_POLES_HZ])
+    mag /= np.abs(n4 / d4)
+
+    # Brick-wall at weighted BW limit
+    mag[f > _AES6_WTD_BW] = 0.0
+    mag[f == 0] = 0.0
+    return mag
+
 
 def _make_aes6_weighting_filter(fs=1000.0):
     """
-    AES6-2008 frequency weighting filter.
+    AES6-2008 frequency weighting filter (IIR, legacy).
 
-    Analog prototype optimized via Wurcer's methodology (brute grid +
-    differential evolution, PTP error metric) against all 17 AES6 Table 1
-    spec points.  Designed for fs=1000 Hz (post-SRC).
-
-    Topology:
-      - 3 zeros at DC (s^3)          -> 18 dB/oct highpass
-      - Triple real pole at 0.6265 Hz -> HP-to-BP transition shaping
-      - 1 real pole at 11.32 Hz      -> ~6 dB/oct LPF rolloff
-      - 1 finite zero at 227.9 Hz    -> HF rolloff shaping
-
-    Performance at fs=1000 Hz:
-      PTP error vs Table 1:  1.013 dB
-      17/17 spec points:     ALL PASS
-      Min margin to tol:     1.32 dB (at 1.6 Hz)
+    Kept for backward compatibility with device input path.
+    Audio path now uses _aes6_weighting_magnitude() in FFT domain.
 
     Returns (b, a) digital filter coefficients via bilinear transform.
     """
-    POLES_HZ = [0.626524, 0.626524, 0.626524, 11.316542]
-    ZERO_FINITE_HZ = 227.918719
-
-    num_s = np.convolve([1.0, 0, 0, 0], [1, 2 * np.pi * ZERO_FINITE_HZ])
+    num_s = np.convolve([1.0, 0, 0, 0], [1, 2 * np.pi * _AES6_ZERO_HZ])
     den_s = np.array([1.0])
-    for p in POLES_HZ:
+    for p in _AES6_POLES_HZ:
         den_s = np.convolve(den_s, [1, 2 * np.pi * p])
 
     b, a = bilinear(num_s, den_s, fs=fs)
@@ -301,43 +466,6 @@ def _make_aes6_weighting_filter(fs=1000.0):
     _, h_ref = freqz(b, a, worN=[w4])
     b /= np.abs(h_ref[0])
     return b, a
-
-
-def _src_to_1khz(signal, fs):
-    """
-    Sample-rate convert deviation signal to 1 kHz.
-
-    Odd-extension pads the signal before resample_poly (same technique
-    scipy's filtfilt uses internally) — preserves both amplitude and
-    derivative at boundaries, preventing FIR anti-aliasing ringing.
-
-    Returns (signal_1k, 1000.0) or (signal, fs) if already at 1 kHz.
-    """
-    FS_TARGET = 1000
-    if abs(fs - FS_TARGET) < 0.5:
-        return signal, float(fs)
-
-    from math import gcd
-    g = gcd(int(FS_TARGET), int(round(fs)))
-    up = int(FS_TARGET) // g
-    down = int(round(fs)) // g
-
-    # Odd extension (filtfilt-style): preserves both amplitude AND derivative
-    # at boundary.  2*signal[0] - signal[N:0:-1] continues the slope smoothly.
-    pad_n = min(int(0.5 * fs), len(signal) // 4)
-    padded = np.concatenate([
-        2 * signal[0] - signal[pad_n:0:-1],
-        signal,
-        2 * signal[-1] - signal[-2:-pad_n - 2:-1],
-    ])
-
-    resampled = resample_poly(padded, up, down)
-
-    # Trim mirrored portions
-    pad_out = int(round(pad_n * up / down))
-    trimmed = resampled[pad_out:len(resampled) - pad_out]
-
-    return trimmed, float(FS_TARGET)
 
 
 # ========================= METRICS =========================
@@ -388,138 +516,125 @@ def _despike_plot(dev_pct):
 
 
 def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
-                        unweighted_bw='virtins'):
+                        unweighted_bw='virtins', lp_cut=None):
     """
     Compute all wow & flutter metrics from fractional deviation signal.
 
-    Unweighted metrics computed at original sample rate (pre-SRC) to
-    preserve full bandwidth up to 0.4×carrier.
-    Weighted metrics computed at 1 kHz via SRC (AES6 weighting filter
-    uses lfilter + lfilter_zi, causal, zero transient).
+    Single-FFT architecture: one rfft, then spectral masks for all metrics.
+    No IIR filters, no SRC, no decimation.
+
+      Unweighted: brick-wall at 0.4×carrier, band split via masks
+      Weighted:   AES6 analog magnitude × 400 Hz brick wall, band split
 
     Parameters:
         deviation_frac: fractional deviation signal (f - f_mean) / f_mean
         fs: sample rate of deviation_frac (Hz)
         carrier_freq: detected carrier frequency (Hz)
         skip_seconds: seconds to skip at start for filter settling
-        unweighted_bw: bandwidth mode for unweighted metrics
-            'virtins' (default): LP at 0.4×carrier, no HP — matches
-                Virtins Multi-Instrument and satisfies AES6-2008 §6.1.1
-                NOTE ("at least 0.2 Hz to 200 Hz").
-            'aes6_min': BP 0.2–200 Hz — minimum AES6 NOTE range.
+        unweighted_bw: 'virtins' (0.4×carrier) or 'aes6_min' (200 Hz)
+        lp_cut: explicit unweighted BW limit in Hz (overrides unweighted_bw)
 
     Returns:
         standard: dict of standardized metrics (AES6/DIN/IEC)
         non_standard: dict of non-standardized metrics
-        dev_unwtd: LP-filtered fractional deviation used for unweighted metrics
+        dev_unwtd: fractional deviation (unfiltered, for caller's use)
     """
     nyq = fs / 2.0
-    n_total = len(deviation_frac)
-    capture_dur = n_total / fs
     skip = int(skip_seconds * fs)
+    dev = deviation_frac[skip:]
 
-    # =================================================================
-    # Unweighted (at original sample rate — preserves full bandwidth)
-    # =================================================================
-    if unweighted_bw == 'aes6_min':
-        # AES6 §6.1.1 NOTE minimum: 0.2–200 Hz bandpass
-        bp_lo = 0.2
-        bp_hi = min(200.0, nyq * 0.95)
-        if bp_hi > bp_lo:
-            sos_u = butter(4, [bp_lo / nyq, bp_hi / nyq],
-                           btype='band', output='sos')
-            dev_unwtd = sosfiltfilt(sos_u, deviation_frac)
-        else:
-            dev_unwtd = deviation_frac.copy()
-        unwtd_flutter_hi = bp_hi
+    # --- Zero-crossing trim ---
+    # Trim to positive-going zero crossings at both ends so the FFT
+    # sees a signal that starts and ends near zero.  Eliminates spectral
+    # leakage from non-integer modulation cycles that otherwise spreads
+    # energy across band boundaries (e.g. 4 Hz tone leaking into flutter).
+    search_n = min(int(2.0 * fs), len(dev) // 4)
+    if search_n > 1:
+        zc_start = 0
+        for i in range(search_n):
+            if dev[i] <= 0 and dev[i + 1] > 0:
+                zc_start = i + 1
+                break
+        zc_end = len(dev)
+        for i in range(len(dev) - 1, len(dev) - search_n, -1):
+            if dev[i - 1] <= 0 and dev[i] > 0:
+                zc_end = i
+                break
+        dev = dev[zc_start:zc_end]
+
+    N = len(dev)
+
+    # --- Bandwidth limits ---
+    if lp_cut is not None:
+        bw_hz = min(lp_cut, nyq * 0.95)
+    elif unweighted_bw == 'aes6_min':
+        bw_hz = min(200.0, nyq * 0.95)
     else:
-        # Virtins spec: LP at 0.4×carrier, no HP (lower bound = 1/dur)
-        lp_hi = min(0.4 * carrier_freq, nyq * 0.95)
-        if lp_hi > 0:
-            sos_u = butter(4, lp_hi / nyq, btype='low', output='sos')
-            dev_unwtd = sosfiltfilt(sos_u, deviation_frac)
-        else:
-            dev_unwtd = deviation_frac.copy()
-        unwtd_flutter_hi = lp_hi
+        bw_hz = min(0.4 * carrier_freq, nyq * 0.95)
 
-    dev_u = dev_unwtd[skip:]
-    unwtd_peak = float(np.percentile(np.abs(dev_u), 95) * 100.0)
-    unwtd_rms = float(np.sqrt(np.mean(dev_u**2)) * 100.0)
+    # --- Single FFT ---
+    X = np.fft.rfft(dev)
+    freqs = np.fft.rfftfreq(N, d=1.0 / fs)
 
-    # --- Unweighted wow/flutter band separation (Virtins spec) ---
-    # Wow: 0.5–6 Hz, Flutter: 6 Hz – unwtd_flutter_hi
+    # One-sided power spectrum (rectangular window, exact Parseval)
+    P = np.abs(X) ** 2
+    P[1:-1] *= 2.0
+
+    # --- Unweighted BW mask ---
+    bw_mask = np.zeros(len(freqs))
+    bw_mask[freqs <= bw_hz] = 1.0
+
+    # --- AES6 weighting magnitude (includes 400 Hz brick wall) ---
+    W = _aes6_weighting_magnitude(freqs)
+    W2 = W ** 2  # power weighting
+
+    # --- Band masks (wow/flutter/drift) ---
     wow_cut = min(6.0, nyq * 0.95)
-    unwtd_wow_rms = 0.0
-    unwtd_flutter_rms = 0.0
-    if wow_cut > 0.5:
-        wow_lo = 0.5
-        if wow_lo < nyq * 0.95 and wow_cut > wow_lo:
-            sos_wow_u = butter(6, [wow_lo / nyq, wow_cut / nyq],
-                               btype='band', output='sos')
-            wow_sig_u = sosfiltfilt(sos_wow_u, dev_unwtd)
-            unwtd_wow_rms = float(np.sqrt(np.mean(wow_sig_u[skip:]**2)) * 100.0)
+    _WOW_FLT_TRANS = 0.50
+    band_defs = {
+        'drift':   (0.05, 0.5, 0, 0),
+        'wow':     (0.5, wow_cut, 0, _WOW_FLT_TRANS),
+        'flutter': (wow_cut, bw_hz, _WOW_FLT_TRANS, 0),
+    }
+    masks = _build_band_masks(freqs, band_defs)
 
-        if unwtd_flutter_hi > wow_cut:
-            sos_flutter_u = butter(6, [wow_cut / nyq, unwtd_flutter_hi / nyq],
-                                   btype='band', output='sos')
-            flutter_sig_u = sosfiltfilt(sos_flutter_u, dev_unwtd)
-            unwtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig_u[skip:]**2)) * 100.0)
+    # --- Unweighted metrics (Parseval) ---
+    P_unwtd = P * bw_mask
+    unwtd_rms_sq = 0.0
+    band_results = {}
+    for name, mask in masks.items():
+        band_power = np.sum(P_unwtd * mask)
+        rms = float(np.sqrt(band_power / (N * N))) * 100.0
+        band_results[name] = rms
+        unwtd_rms_sq += rms ** 2
+    unwtd_rms = float(np.sqrt(unwtd_rms_sq))
 
-    # --- Drift (non-standardized, at original sample rate) ---
-    drift_rms = 0.0
-    drift_lo = max(0.05, 1.0 / capture_dur)
-    drift_hi = 0.5
-    if drift_hi > drift_lo and drift_hi < nyq * 0.95:
-        drift_taper_s = 2.0
-        taper_n = min(int(drift_taper_s * fs), n_total // 4)
-        taper_window = np.ones(n_total)
-        ramp = 0.5 * (1 - np.cos(np.pi * np.arange(taper_n) / taper_n))
-        taper_window[:taper_n] = ramp
-        taper_window[-taper_n:] = ramp[::-1]
+    # Unweighted peak: IFFT of BW-limited spectrum for percentile
+    X_bw = X.copy()
+    X_bw[freqs > bw_hz] = 0.0
+    dev_bw = np.fft.irfft(X_bw, n=N)
+    unwtd_peak = float(np.percentile(np.abs(dev_bw), 95) * 100.0)
 
-        drift_order = 10
-        sos_drift = butter(drift_order,
-                           [drift_lo / nyq, drift_hi / nyq],
-                           btype='band', output='sos')
-        drift_sig = sosfiltfilt(sos_drift, deviation_frac * taper_window)
+    # --- Weighted metrics (Parseval with AES6 magnitude) ---
+    P_wtd = P * W2
+    wtd_rms = float(np.sqrt(np.sum(P_wtd) / (N * N))) * 100.0
 
-        drift_skip = max(skip, taper_n, int(2.0 * fs))
-        if n_total > 2 * drift_skip:
-            drift_sig = drift_sig[drift_skip:-drift_skip]
-            drift_rms = float(np.sqrt(np.mean(drift_sig**2)) * 100.0)
+    # Weighted band split (wow/flutter only, drift killed by weighting)
+    wtd_band_defs = {
+        'wow':     (0, wow_cut, 0, _WOW_FLT_TRANS),
+        'flutter': (wow_cut, _AES6_WTD_BW, _WOW_FLT_TRANS, 0),
+    }
+    wtd_masks = _build_band_masks(freqs, wtd_band_defs)
+    wtd_wow_rms = float(np.sqrt(np.sum(P_wtd * wtd_masks['wow']) / (N * N))) * 100.0
+    wtd_flutter_rms = float(np.sqrt(np.sum(P_wtd * wtd_masks['flutter']) / (N * N))) * 100.0
 
-    # =================================================================
-    # Weighted (SRC to 1 kHz for AES6 weighting filter)
-    # =================================================================
-    dev_w, fs_w = _src_to_1khz(deviation_frac, fs)
-    nyq_w = fs_w / 2.0
-    skip_w = int(skip_seconds * fs_w)
+    # Weighted peak: IFFT of weighted spectrum for percentile
+    X_wtd = X * W
+    dev_wtd = np.fft.irfft(X_wtd, n=N)
+    wtd_peak = float(np.percentile(np.abs(dev_wtd), 95) * 100.0)
 
-    b_w, a_w = _make_aes6_weighting_filter(fs_w)
-    zi = lfilter_zi(b_w, a_w) * dev_w[0]
-    dev_weighted, _ = lfilter(b_w, a_w, dev_w, zi=zi)
-    dw = dev_weighted[skip_w:]
-    wtd_peak = float(np.percentile(np.abs(dw), 95) * 100.0)
-    wtd_rms = float(np.sqrt(np.mean(dw**2)) * 100.0)
-
-    # --- Weighted wow/flutter (standardized) ---
-    wow_cut_w = min(6.0, nyq_w * 0.95)
-    wtd_wow_rms = 0.0
-    wtd_flutter_rms = 0.0
-    if wow_cut_w > 0.5:
-        sos_wow = butter(6, wow_cut_w / nyq_w, btype='low', output='sos')
-        wow_sig = sosfiltfilt(sos_wow, dev_weighted)
-        wtd_wow_rms = float(np.sqrt(np.mean(wow_sig[skip_w:]**2)) * 100.0)
-
-        sos_flutter = butter(6, wow_cut_w / nyq_w, btype='high', output='sos')
-        flutter_sig = sosfiltfilt(sos_flutter, dev_weighted)
-        wtd_flutter_rms = float(np.sqrt(np.mean(flutter_sig[skip_w:]**2)) * 100.0)
-
-    # --- Confidence ---
-    # Placeholder: all 0 (full confidence).
-    # Future: heuristics based on duration, crossing density, SNR, etc.
+    # --- Build result dicts ---
     conf = 0
-
     standard = {
         'weighted_peak':        _metric(wtd_peak, conf),
         'weighted_rms':         _metric(wtd_rms, conf),
@@ -530,12 +645,12 @@ def _compute_wf_metrics(deviation_frac, fs, carrier_freq, skip_seconds=0.0,
     }
 
     non_standard = {
-        'unweighted_wow_rms':     _metric(unwtd_wow_rms, conf),
-        'unweighted_flutter_rms': _metric(unwtd_flutter_rms, conf),
-        'drift_rms':              _metric(drift_rms, conf),
+        'unweighted_wow_rms':     _metric(band_results['wow'], conf),
+        'unweighted_flutter_rms': _metric(band_results['flutter'], conf),
+        'drift_rms':              _metric(band_results['drift'], conf),
     }
 
-    return standard, non_standard, dev_unwtd
+    return standard, non_standard, deviation_frac
 
 
 # ========================= SPECTRUM =========================
@@ -1078,7 +1193,6 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     nyq = fs / 2.0
     duration = len(sig) / fs
     await _status(f"Loaded: {duration:.1f}s at {int(fs)} Hz")
-    await _status("Preconditioning signal...")
 
     # 0. Carrier amplitude gate — trim leading/trailing silence
     #    ZC with hysteresis naturally ignored silence; Hilbert demod does not
@@ -1114,13 +1228,21 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     await _status("Detecting carrier frequency...")
     f_est = _estimate_carrier_freq(sig, fs)
 
-    # 2. Bandpass prefilter — fixed at 0.1×–1.9× carrier
+    # 2. FFT brick-wall bandpass prefilter at carrier ± 0.4×carrier
+    #    Fixed width — always wide enough to pass all FM sidebands.
+    #    Removes broadband noise outside the carrier region before Hilbert.
     await _status("Applying prefilter...")
+    carrier_max = 0.4 * f_est
+    prefilter_bw = min(carrier_max, nyq * 0.95)
+
     if f_est > 0:
-        bp_low = max(f_est * 0.1, 1.0)
-        bp_high = min(f_est * 1.9, nyq * 0.95)
-        b, a = butter(PREFILTER_ORDER, [bp_low / nyq, bp_high / nyq], btype='band')
-        sig_filtered = filtfilt(b, a, sig)
+        bp_low = f_est - prefilter_bw
+        bp_high = f_est + prefilter_bw
+        X_sig = np.fft.rfft(sig)
+        freqs_sig = np.fft.rfftfreq(len(sig), d=1.0 / fs)
+        X_sig[(freqs_sig < bp_low) | (freqs_sig > bp_high)] = 0.0
+        sig_filtered = np.fft.irfft(X_sig, n=len(sig))
+        del X_sig
     else:
         sig_filtered = sig
 
@@ -1131,30 +1253,26 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     inst_freq = np.diff(phase) * fs / (2.0 * np.pi)
     del analytic, phase
 
-    # 4. Lowpass — FM measurement bandwidth
-    #    Resolve fm_bw: None → max (0.4×carrier), 'aes_min' → 200 Hz, numeric → Hz
-    #    Always clamped to 0.4×carrier (Nyquist of FM system)
-    carrier_max = 0.4 * f_est
-    if fm_bw is None:
-        lp_cut = carrier_max
-    elif fm_bw == 'aes_min':
-        lp_cut = min(200.0, carrier_max)
-    else:
+    # 4. Measurement bandwidth — user-selectable post-demod LP
+    #    Controls what modulation frequencies are included in the measurement.
+    #    Independent of the prefilter (which is always at 0.4×carrier).
+    #    Default: wide open at 0.4×carrier. Frontend decides what to present.
+    if fm_bw is not None:
         lp_cut = min(float(fm_bw), carrier_max)
+    else:
+        lp_cut = carrier_max
     lp_cut = min(lp_cut, nyq * 0.95)
 
-    if lp_cut > 0:
-        sos_lp = butter(4, lp_cut / nyq, btype='low', output='sos')
-        inst_freq = sosfiltfilt(sos_lp, inst_freq)
+    await _status("Applying measurement bandwidth limit...")
+    inst_freq = _fft_bw_limit(inst_freq, fs, lp_cut)
 
     # 5. Edge trim — Hilbert transient settling time
-    #    The FFT-based Hilbert has edge artifacts that decay over a few cycles
-    #    of the lowest frequency present.  After prefilter, f_low = 0.1×carrier.
-    #    We trim 3 cycles × 2× safety margin = 6 / f_low from each edge.
+    #    FFT brick-wall prefilter passes carrier ± 0.4×carrier, so the
+    #    lowest frequency in the filtered signal is 0.6×carrier.
     await _status("Trimming edges...")
     n_if = len(inst_freq)
 
-    f_low = max(f_est * 0.1, 1.0)                      # lowest freq after prefilter
+    f_low = max(f_est * 0.6, 1.0)                      # lowest freq after prefilter
     edge_time = 6.0 / f_low                             # 3 cycles × 2× margin
     edge_samples = max(int(edge_time * fs), int(0.01 * fs))  # floor 10 ms
     edge_samples = min(edge_samples, n_if // 4)         # never trim more than 25% per side
@@ -1169,25 +1287,32 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     deviation_frac = (inst_freq - f_mean) / f_mean
     del inst_freq
 
-    # 7. Decimate — LP already serves as AA filter
-    min_rate = max(2.0 * lp_cut, 1000.0)
-    dec_factor = max(1, int(fs / min_rate))
-    output_rate = float(fs / dec_factor)
-    deviation_frac = deviation_frac[::dec_factor]
+    # 6. FFT brick-wall bandwidth limit + band-split metrics (no decimation)
+    #    Replaces Butterworth LP + decimation. Zero passband attenuation
+    #    up to lp_cut, then hard cutoff — matches MI's observed behavior.
+    output_rate = float(fs)
 
-    t_uniform = np.arange(len(deviation_frac)) / output_rate + edge_time_offset
-
-    # 7. Metrics — returns LP-filtered deviation used for unweighted measurement
     await _status("Computing metrics...")
-    standard, non_standard, dev_unwtd = _compute_wf_metrics(deviation_frac, output_rate, f_est)
+    standard, non_standard, dev_unwtd = _compute_wf_metrics(
+        deviation_frac, output_rate, f_est, lp_cut=lp_cut)
 
-    # Plot data: MAD despike at native rate
-    deviation_pct = _despike_plot(dev_unwtd * 100.0)
+    # Plot data: brick-wall BW-limited, despiked, decimated for display
+    dev_bw = _fft_bw_limit(dev_unwtd, output_rate, lp_cut)
+    deviation_pct = _despike_plot(dev_bw * 100.0)
 
-    # 8. Spectrum + peaks
+    # Decimate plot data for frontend display (target ~2500 Hz)
+    plot_rate = output_rate
+    plot_dec = max(1, int(output_rate / 2500))
+    if plot_dec > 1:
+        deviation_pct = deviation_pct[::plot_dec]
+        plot_rate = output_rate / plot_dec
+
+    t_uniform = np.arange(len(deviation_pct)) / plot_rate + edge_time_offset
+
+    # 7. Spectrum + peaks
     await _status("Computing spectrum...")
     spec_max_freq = lp_cut if lp_cut > 0 else 50.0
-    spectrum = _compute_spectrum(deviation_pct, output_rate,
+    spectrum = _compute_spectrum(deviation_pct, plot_rate,
                                  max_freq=spec_max_freq)
 
     # RPM: use user-provided, or auto-detect from spectrum
@@ -1220,10 +1345,10 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     spectrum['coupling_threshold'] = None
     _state['_coupling_threshold'] = None
 
-    # Stash state for getPlotData
+    # Stash state for getPlotData (plot_rate = decimated display rate)
     _state['_deviation_pct'] = deviation_pct
     _state['_t_uniform'] = t_uniform
-    _state['_output_rate'] = output_rate
+    _state['_output_rate'] = plot_rate
     _state['_f_mean'] = f_mean
     _state['_f_rot'] = f_rot
     _state['_input_type'] = 'audio'
@@ -1238,7 +1363,7 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     # Polar requires rpm (need rotation period to define one revolution)
     if f_rot is not None and f_rot > 0:
         sec_per_rev = 1.0 / f_rot
-        samples_per_rev = int(round(sec_per_rev * output_rate))
+        samples_per_rev = int(round(sec_per_rev * plot_rate))
         max_revolutions = len(deviation_pct) // samples_per_rev if samples_per_rev > 0 else 0
         available['polar'] = {'max_revolutions': max_revolutions}
 
