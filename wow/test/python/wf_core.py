@@ -1257,10 +1257,12 @@ async def _analyze_audio(pcm_data, sample_rate, fm_bw=None):
     #    Controls what modulation frequencies are included in the measurement.
     #    Independent of the prefilter (which is always at 0.4×carrier).
     #    Default: wide open at 0.4×carrier. Frontend decides what to present.
-    if fm_bw is not None:
-        lp_cut = min(float(fm_bw), carrier_max)
-    else:
+    if fm_bw is None:
         lp_cut = carrier_max
+    elif fm_bw == 'aes_min':
+        lp_cut = min(200.0, carrier_max)
+    else:
+        lp_cut = min(float(fm_bw), carrier_max)
     lp_cut = min(lp_cut, nyq * 0.95)
 
     await _status("Applying measurement bandwidth limit...")
